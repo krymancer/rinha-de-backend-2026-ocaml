@@ -1,0 +1,9 @@
+_build/
+*.install
+*.swp
+.merlin
+.vscode/
+.DS_Store
+*.bin
+references.json.gz
+references.json
