@@ -98,6 +98,48 @@ let test_load_header_bad_magic () =
       (Failure "Index_io.load_header: bad magic")
       (fun () -> ignore (Index_io.load_header path)))
 
+let test_load_mmap_roundtrip () =
+  with_tmp_file (fun path ->
+    let n = 1000 and c = 8 and dim = 14 in
+    let header = Index_io.plan_layout ~n ~c ~dim ~nprobe_default:4 in
+    let centroids = mk_centroids ~c ~dim in
+    let offs      = mk_offsets ~c ~n in
+    let vecs      = mk_vecs ~n ~dim in
+    let lbls      = mk_labels ~n in
+    Index_io.save ~path ~header ~centroids
+      ~cell_offsets:offs ~vecs ~labels:lbls;
+    let h2, views = Index_io.load_mmap path in
+    Alcotest.(check int) "header n" n h2.n;
+    (* Spot-check a few centroid values *)
+    Alcotest.(check (float 1e-6)) "centroid[0]"
+      (Bigarray.Array1.get centroids 0)
+      (Bigarray.Array1.get views.centroids 0);
+    Alcotest.(check (float 1e-6)) "centroid[c*dim-1]"
+      (Bigarray.Array1.get centroids (c * dim - 1))
+      (Bigarray.Array1.get views.centroids (c * dim - 1));
+    (* Spot-check vecs *)
+    Alcotest.(check (float 1e-6)) "vec[0]"
+      (Bigarray.Array1.get vecs 0)
+      (Bigarray.Array1.get views.vecs 0);
+    Alcotest.(check (float 1e-6)) "vec[n*dim-1]"
+      (Bigarray.Array1.get vecs (n * dim - 1))
+      (Bigarray.Array1.get views.vecs (n * dim - 1));
+    (* Cell offsets *)
+    Alcotest.(check int64) "offs[0]"
+      (Bigarray.Array1.get offs 0)
+      (Bigarray.Array1.get views.cell_offsets 0);
+    Alcotest.(check int64) "offs[c]"
+      (Bigarray.Array1.get offs c)
+      (Bigarray.Array1.get views.cell_offsets c);
+    (* Labels *)
+    Alcotest.(check char) "lbl[0]"
+      (Bytes.get lbls 0)
+      (Bigarray.Array1.get views.labels 0);
+    Alcotest.(check char) "lbl[n-1]"
+      (Bytes.get lbls (n - 1))
+      (Bigarray.Array1.get views.labels (n - 1));
+    Unix.close views.fd)
+
 let () =
   Alcotest.run "index_io" [
     "layout", [
@@ -109,5 +151,8 @@ let () =
     "load_header", [
       Alcotest.test_case "save/load round-trip" `Quick test_save_load_header_roundtrip;
       Alcotest.test_case "rejects bad magic"     `Quick test_load_header_bad_magic;
+    ];
+    "load_mmap", [
+      Alcotest.test_case "round-trip mmap views" `Quick test_load_mmap_roundtrip;
     ];
   ]

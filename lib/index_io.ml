@@ -139,5 +139,26 @@ type mmap_views = {
   labels       : (char,  Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t;
 }
 
-let load_mmap _path : header * mmap_views =
-  failwith "Index_io.load_mmap: not yet implemented"
+let load_mmap path =
+  let header = load_header path in
+  let fd = Unix.openfile path [Unix.O_RDONLY] 0 in
+  let map_f32 ~pos ~len =
+    Unix.map_file fd ~pos:(Int64.of_int pos)
+      Bigarray.float32 Bigarray.c_layout false [| len |]
+    |> Bigarray.array1_of_genarray
+  in
+  let map_i64 ~pos ~len =
+    Unix.map_file fd ~pos:(Int64.of_int pos)
+      Bigarray.int64 Bigarray.c_layout false [| len |]
+    |> Bigarray.array1_of_genarray
+  in
+  let map_chr ~pos ~len =
+    Unix.map_file fd ~pos:(Int64.of_int pos)
+      Bigarray.char Bigarray.c_layout false [| len |]
+    |> Bigarray.array1_of_genarray
+  in
+  let centroids    = map_f32 ~pos:header.centroids_off    ~len:(header.c * header.dim) in
+  let cell_offsets = map_i64 ~pos:header.cell_offsets_off ~len:(header.c + 1) in
+  let vecs         = map_f32 ~pos:header.vecs_off         ~len:(header.n * header.dim) in
+  let labels       = map_chr ~pos:header.labels_off       ~len:header.n in
+  header, { fd; centroids; cell_offsets; vecs; labels }
