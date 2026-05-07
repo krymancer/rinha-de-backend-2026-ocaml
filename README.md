@@ -45,9 +45,10 @@ dune exec bin/server/main.exe -- --n 3000000   # synthetic data, will switch to 
 
 ## TODO
 
-- [ ] Load real `references.json.gz` and serialize to binary `index.bin`
-- [ ] `mmap` index in server
-- [ ] `Dockerfile` + `docker-compose.yml` (nginx LB + 2× api)
+- [x] Load real `references.json.gz` and serialize to binary `index.bin`
+- [x] `mmap` index in server
+- [x] `Dockerfile` + `docker-compose.yml` (nginx LB + 2× api)
+- [ ] Phase 2: int8 quantization (gated on Mac-Mini-class p99 measurement)
 - [ ] Verify p99 on test-box-class hardware
 - [ ] Tune nprobe based on real-data recall
 

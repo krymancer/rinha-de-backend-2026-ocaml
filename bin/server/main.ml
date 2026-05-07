@@ -1,33 +1,19 @@
-(* Fraud detection HTTP server.
-   Currently builds synthetic 3M-vec IVF index at startup (real data wiring next). *)
+(* Fraud detection HTTP server — mmap'd index.bin. *)
 
 open Lwt.Infix
 
-let n = 3_000_000
-let dim = 14
 let nprobe = 8
 let port = ref 9999
-let n_arg = ref n
+let index_path = ref "/app/index.bin"
 
-let build_synth_index () : Fraud.Index.t =
+let load_index path : Fraud.Index.t =
   let t0 = Unix.gettimeofday () in
-  Printf.printf "building synth %d vecs ...\n%!" !n_arg;
-  let vs = Bigarray.Array1.create Bigarray.float32 Bigarray.c_layout (!n_arg * dim) in
-  let st = Random.State.make [| 42 |] in
-  for i = 0 to !n_arg * dim - 1 do
-    Bigarray.Array1.unsafe_set vs i (Random.State.float st 1.0)
-  done;
-  let labels = Bytes.create !n_arg in
-  let st2 = Random.State.make [| 7 |] in
-  for i = 0 to !n_arg - 1 do
-    Bytes.unsafe_set labels i
-      (if Random.State.float st2 1.0 < 0.05 then '\001' else '\000')
-  done;
-  Printf.printf "data ready in %.2fs, building IVF ...\n%!" (Unix.gettimeofday () -. t0);
-  let t1 = Unix.gettimeofday () in
-  let idx = Fraud.Index.build vs !n_arg labels in
-  Printf.printf "IVF built in %.2fs (total %.2fs)\n%!"
-    (Unix.gettimeofday () -. t1) (Unix.gettimeofday () -. t0);
+  let h, v = Fraud.Index_io.load_mmap path in
+  let idx = Fraud.Index.of_segments
+    ~vecs:v.vecs ~n:h.n ~labels:v.labels
+    ~centroids:v.centroids ~c:h.c ~cell_offsets:v.cell_offsets in
+  Printf.printf "[server] mmapped index n=%d c=%d in %.3fs from %s\n%!"
+    h.n h.c (Unix.gettimeofday () -. t0) path;
   idx
 
 let respond_string reqd ?(status = `OK) ?(content_type = "text/plain") body =
@@ -75,12 +61,12 @@ let error_handler _client_addr ?request:_ _err start_response =
 
 let main () =
   let speclist = [
-    "--port", Arg.Set_int port, "port (default 9999)";
-    "--n", Arg.Set_int n_arg, "synth vec count (default 3M)";
+    "--port",  Arg.Set_int port,           "port (default 9999)";
+    "--index", Arg.Set_string index_path,  "path to index.bin (default /app/index.bin)";
   ] in
   Arg.parse speclist (fun _ -> ()) "fraud-server";
 
-  let index = build_synth_index () in
+  let index = load_index !index_path in
 
   let listen_addr = Unix.(ADDR_INET (inet_addr_any, !port)) in
   let connection_handler =
@@ -91,7 +77,7 @@ let main () =
   Lwt_main.run begin
     Lwt_io.establish_server_with_client_socket listen_addr connection_handler
     >>= fun _server ->
-    Printf.printf "listening on :%d\n%!" !port;
+    Printf.printf "[server] listening on :%d\n%!" !port;
     fst (Lwt.wait ())
   end
 
