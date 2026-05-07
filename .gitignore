@@ -4,6 +4,9 @@ _build/
 .merlin
 .vscode/
 .DS_Store
-*.bin
+# index artifacts
+index.bin
+resources/index.bin
 references.json.gz
 references.json
+# do NOT ignore tests/fixtures/*.json — they are committed test data
