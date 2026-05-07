@@ -69,6 +69,35 @@ let test_save_writes_correct_size () =
     Alcotest.(check int) "file size matches header.file_size"
       header.file_size st.st_size)
 
+let test_save_load_header_roundtrip () =
+  with_tmp_file (fun path ->
+    let n = 1000 and c = 8 and dim = 14 in
+    let header = Index_io.plan_layout ~n ~c ~dim ~nprobe_default:4 in
+    Index_io.save ~path ~header
+      ~centroids:(mk_centroids ~c ~dim)
+      ~cell_offsets:(mk_offsets ~c ~n)
+      ~vecs:(mk_vecs ~n ~dim)
+      ~labels:(mk_labels ~n);
+    let h2 = Index_io.load_header path in
+    Alcotest.(check int) "n" header.n h2.n;
+    Alcotest.(check int) "c" header.c h2.c;
+    Alcotest.(check int) "dim" header.dim h2.dim;
+    Alcotest.(check int) "nprobe_default" header.nprobe_default h2.nprobe_default;
+    Alcotest.(check int) "centroids_off" header.centroids_off h2.centroids_off;
+    Alcotest.(check int) "cell_offsets_off" header.cell_offsets_off h2.cell_offsets_off;
+    Alcotest.(check int) "vecs_off" header.vecs_off h2.vecs_off;
+    Alcotest.(check int) "labels_off" header.labels_off h2.labels_off;
+    Alcotest.(check int) "file_size" header.file_size h2.file_size)
+
+let test_load_header_bad_magic () =
+  with_tmp_file (fun path ->
+    let oc = Out_channel.open_bin path in
+    Out_channel.output_string oc (String.make 4096 '\000');
+    Out_channel.close oc;
+    Alcotest.check_raises "bad magic raises"
+      (Failure "Index_io.load_header: bad magic")
+      (fun () -> ignore (Index_io.load_header path)))
+
 let () =
   Alcotest.run "index_io" [
     "layout", [
@@ -76,5 +105,9 @@ let () =
     ];
     "save", [
       Alcotest.test_case "save writes correct size" `Quick test_save_writes_correct_size;
+    ];
+    "load_header", [
+      Alcotest.test_case "save/load round-trip" `Quick test_save_load_header_roundtrip;
+      Alcotest.test_case "rejects bad magic"     `Quick test_load_header_bad_magic;
     ];
   ]

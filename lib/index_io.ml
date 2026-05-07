@@ -104,7 +104,32 @@ let save ~path ~header ~centroids ~cell_offsets ~vecs ~labels =
     (* Labels *)
     Out_channel.output_bytes oc (Bytes.sub labels 0 header.n))
 
-let load_header _path : header = failwith "Index_io.load_header: not yet implemented"
+let read_exact ic n =
+  let b = Bytes.create n in
+  really_input ic b 0 n;
+  b
+
+let load_header path =
+  let ic = In_channel.open_bin path in
+  let close () = In_channel.close ic in
+  Fun.protect ~finally:close (fun () ->
+    let h = read_exact ic header_size in
+    let m = Bytes.get_int32_le h 0 in
+    if m <> magic then failwith "Index_io.load_header: bad magic";
+    let v = Bytes.get_int32_le h 4 in
+    if v <> version then failwith "Index_io.load_header: bad version";
+    let n              = Int64.to_int (Bytes.get_int64_le h 8) in
+    let c              = Int32.to_int (Bytes.get_int32_le h 16) in
+    let dim            = Int32.to_int (Bytes.get_int32_le h 20) in
+    let nprobe_default = Int32.to_int (Bytes.get_int32_le h 24) in
+    (* skip pad u32 at offset 28 *)
+    let centroids_off    = Int64.to_int (Bytes.get_int64_le h 32) in
+    let cell_offsets_off = Int64.to_int (Bytes.get_int64_le h 40) in
+    let vecs_off         = Int64.to_int (Bytes.get_int64_le h 48) in
+    let labels_off       = Int64.to_int (Bytes.get_int64_le h 56) in
+    let file_size        = Int64.to_int (Bytes.get_int64_le h 64) in
+    { n; c; dim; nprobe_default;
+      centroids_off; cell_offsets_off; vecs_off; labels_off; file_size })
 
 type mmap_views = {
   fd : Unix.file_descr;
