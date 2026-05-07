@@ -131,6 +131,9 @@ let load_header path =
     { n; c; dim; nprobe_default;
       centroids_off; cell_offsets_off; vecs_off; labels_off; file_size })
 
+(* mmap_views.fd MUST remain open for the entire lifetime of the four
+   Bigarray fields below. Closing fd while a Bigarray view is still
+   referenced is undefined behavior. *)
 type mmap_views = {
   fd : Unix.file_descr;
   centroids    : (float, Bigarray.float32_elt, Bigarray.c_layout) Bigarray.Array1.t;
@@ -139,6 +142,9 @@ type mmap_views = {
   labels       : (char,  Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t;
 }
 
+(* mmap_views.fd MUST remain open for the entire lifetime of the four
+   Bigarray fields below. Closing fd while a Bigarray view is still
+   referenced is undefined behavior. *)
 let load_mmap path =
   let header = load_header path in
   let fd = Unix.openfile path [Unix.O_RDONLY] 0 in
