@@ -1,0 +1,10 @@
+_build/
+.git/
+docs/
+tests/fixtures/
+*.swp
+.merlin
+.vscode/
+.DS_Store
+README.md
+index.bin
