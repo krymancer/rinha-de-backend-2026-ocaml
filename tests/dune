@@ -1,3 +1,4 @@
 (tests
- (names test_smoke test_index_io)
- (libraries fraud alcotest))
+ (names test_smoke test_index_io test_refs_reader)
+ (libraries fraud alcotest)
+ (deps (glob_files fixtures/*.json)))
