@@ -140,6 +140,21 @@ let test_load_mmap_roundtrip () =
       (Bigarray.Array1.get views.labels (n - 1));
     Unix.close views.fd)
 
+let test_build_produces_sorted_layout () =
+  let n = 256 and dim = 14 in
+  let vs = Bigarray.Array1.create Bigarray.float32 Bigarray.c_layout (n * dim) in
+  let st = Random.State.make [| 99 |] in
+  for i = 0 to n * dim - 1 do
+    Bigarray.Array1.set vs i (Random.State.float st 1.0)
+  done;
+  let lbls = Bytes.make n '\000' in
+  let idx = Index.build ~c:4 ~iters:3 ~sample:n vs n lbls in
+  Alcotest.(check int) "n" n idx.n;
+  Alcotest.(check int) "c" 4 idx.c;
+  Alcotest.(check int) "cell_offsets length" 5 (Bigarray.Array1.dim idx.cell_offsets);
+  Alcotest.(check int64) "first offset = 0" 0L (Bigarray.Array1.get idx.cell_offsets 0);
+  Alcotest.(check int64) "last offset = n" (Int64.of_int n) (Bigarray.Array1.get idx.cell_offsets 4)
+
 let () =
   Alcotest.run "index_io" [
     "layout", [
@@ -154,5 +169,9 @@ let () =
     ];
     "load_mmap", [
       Alcotest.test_case "round-trip mmap views" `Quick test_load_mmap_roundtrip;
+    ];
+    "index", [
+      Alcotest.test_case "build produces sorted cell-major layout"
+        `Quick test_build_produces_sorted_layout;
     ];
   ]
