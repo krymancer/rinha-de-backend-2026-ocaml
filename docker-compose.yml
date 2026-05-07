@@ -1,6 +1,6 @@
 services:
   api1: &api
-    image: rinha-fraud-ocaml:latest    # local dev tag; CI swaps for ghcr.io tag
+    image: ghcr.io/${GITHUB_REPOSITORY:-krymancer/rinha-de-backend-2026-ocaml}:latest
     platform: linux/amd64
     expose: ["9999"]
     deploy:
