@@ -62,8 +62,7 @@ let request_handler (index, scorer) _client_addr (reqd : Httpaf.Reqd.t) : unit =
       Httpaf.Body.schedule_read body_r ~on_read ~on_eof
     and on_eof () =
       try
-        let json = Yojson.Safe.from_string (Buffer.contents buf) in
-        let v = Fraud.Detect.vectorize json in
+        let v = Fraud.Detect.vectorize_str (Buffer.contents buf) in
         let score = Fraud.Index.fraud_score_with scorer index v ~nprobe in
         let frauds = int_of_float (score *. 5.0 +. 0.5) in
         let frauds = if frauds < 0 then 0 else if frauds > 5 then 5 else frauds in
