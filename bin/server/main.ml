@@ -56,21 +56,15 @@ let request_handler (index, scorer) _client_addr (reqd : Httpaf.Reqd.t) : unit =
     respond_string reqd "ok"
   | `POST, "/fraud-score" ->
     let body_r = Httpaf.Reqd.request_body reqd in
-    let buf = Buffer.create 1024 in
-    let rec on_read bs ~off ~len =
-      Buffer.add_string buf (Bigstringaf.substring bs ~off ~len);
+    (* DIAGNOSTIC: read body to keep keepalive happy but skip parse + kNN.
+       Always reply approved=true. Detection cut will trigger; we want
+       p99_score in isolation to attribute the 80ms tail. *)
+    ignore index; ignore scorer;
+    let rec on_read _bs ~off:_ ~len:_ =
       Httpaf.Body.schedule_read body_r ~on_read ~on_eof
     and on_eof () =
-      try
-        let v = Fraud.Detect.vectorize_str (Buffer.contents buf) in
-        let score = Fraud.Index.fraud_score_with scorer index v ~nprobe in
-        let frauds = int_of_float (score *. 5.0 +. 0.5) in
-        let frauds = if frauds < 0 then 0 else if frauds > 5 then 5 else frauds in
-        Httpaf.Reqd.respond_with_string reqd
-          fraud_response_for.(frauds) fraud_response_body.(frauds)
-      with e ->
-        let msg = Printexc.to_string e in
-        respond_string reqd ~status:`Bad_request ("error: " ^ msg)
+      Httpaf.Reqd.respond_with_string reqd
+        fraud_response_for.(0) fraud_response_body.(0)
     in
     Httpaf.Body.schedule_read body_r ~on_read ~on_eof
   | _ ->
