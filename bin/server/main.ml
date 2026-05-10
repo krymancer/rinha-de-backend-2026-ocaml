@@ -7,46 +7,14 @@ let port = ref 9999
 let index_path = ref "/app/index.bin"
 let socket_path = ref ""
 
-(* Touch every page of the four mmap'd Bigarrays so the kernel pulls them into
-   page cache before we start serving. Without this the first ~thousand
-   requests pay cold-fault penalties on test boxes with slow flash. *)
-let prefault_index (v : Fraud.Index_io.mmap_views) =
-  let touch_f32 (ba : (float, Bigarray.float32_elt, Bigarray.c_layout)
-                       Bigarray.Array1.t) =
-    let n = Bigarray.Array1.dim ba in
-    let acc = ref 0.0 in
-    let i = ref 0 in
-    while !i < n do
-      acc := !acc +. Bigarray.Array1.unsafe_get ba !i;
-      i := !i + 1024
-    done;
-    !acc
-  in
-  let touch_chr (ba : (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout)
-                       Bigarray.Array1.t) =
-    let n = Bigarray.Array1.dim ba in
-    let acc = ref 0 in
-    let i = ref 0 in
-    while !i < n do
-      acc := !acc lxor Char.code (Bigarray.Array1.unsafe_get ba !i);
-      i := !i + 4096
-    done;
-    !acc
-  in
-  let _ = touch_f32 v.centroids in
-  let _ = touch_f32 v.vecs in
-  let _ = touch_chr v.labels in
-  ()
-
 let load_index path : Fraud.Index.t * Fraud.Index.scorer =
   let t0 = Unix.gettimeofday () in
   let h, v = Fraud.Index_io.load_mmap path in
-  prefault_index v;
   let idx = Fraud.Index.of_segments
     ~vecs:v.vecs ~n:h.n ~labels:v.labels
     ~centroids:v.centroids ~c:h.c ~cell_offsets:v.cell_offsets in
   let scorer = Fraud.Index.create_scorer ~max_nprobe:nprobe in
-  Printf.printf "[server] mmapped+prefaulted index n=%d c=%d in %.3fs from %s\n%!"
+  Printf.printf "[server] mmapped index n=%d c=%d in %.3fs from %s\n%!"
     h.n h.c (Unix.gettimeofday () -. t0) path;
   idx, scorer
 
