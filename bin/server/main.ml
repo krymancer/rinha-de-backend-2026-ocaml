@@ -2,19 +2,52 @@
 
 open Lwt.Infix
 
-let nprobe = 8
+let nprobe = 4
 let port = ref 9999
 let index_path = ref "/app/index.bin"
 
-let load_index path : Fraud.Index.t =
+(* Touch every page of the four mmap'd Bigarrays so the kernel pulls them into
+   page cache before we start serving. Without this the first ~thousand
+   requests pay cold-fault penalties on test boxes with slow flash. *)
+let prefault_index (v : Fraud.Index_io.mmap_views) =
+  let touch_f32 (ba : (float, Bigarray.float32_elt, Bigarray.c_layout)
+                       Bigarray.Array1.t) =
+    let n = Bigarray.Array1.dim ba in
+    let acc = ref 0.0 in
+    let i = ref 0 in
+    while !i < n do
+      acc := !acc +. Bigarray.Array1.unsafe_get ba !i;
+      i := !i + 1024
+    done;
+    !acc
+  in
+  let touch_chr (ba : (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout)
+                       Bigarray.Array1.t) =
+    let n = Bigarray.Array1.dim ba in
+    let acc = ref 0 in
+    let i = ref 0 in
+    while !i < n do
+      acc := !acc lxor Char.code (Bigarray.Array1.unsafe_get ba !i);
+      i := !i + 4096
+    done;
+    !acc
+  in
+  let _ = touch_f32 v.centroids in
+  let _ = touch_f32 v.vecs in
+  let _ = touch_chr v.labels in
+  ()
+
+let load_index path : Fraud.Index.t * Fraud.Index.scorer =
   let t0 = Unix.gettimeofday () in
   let h, v = Fraud.Index_io.load_mmap path in
+  prefault_index v;
   let idx = Fraud.Index.of_segments
     ~vecs:v.vecs ~n:h.n ~labels:v.labels
     ~centroids:v.centroids ~c:h.c ~cell_offsets:v.cell_offsets in
-  Printf.printf "[server] mmapped index n=%d c=%d in %.3fs from %s\n%!"
+  let scorer = Fraud.Index.create_scorer ~max_nprobe:nprobe in
+  Printf.printf "[server] mmapped+prefaulted index n=%d c=%d in %.3fs from %s\n%!"
     h.n h.c (Unix.gettimeofday () -. t0) path;
-  idx
+  idx, scorer
 
 let respond_string reqd ?(status = `OK) ?(content_type = "text/plain") body =
   let headers = Httpaf.Headers.of_list [
@@ -24,7 +57,7 @@ let respond_string reqd ?(status = `OK) ?(content_type = "text/plain") body =
   let resp = Httpaf.Response.create ~headers status in
   Httpaf.Reqd.respond_with_string reqd resp body
 
-let request_handler index _client_addr (reqd : Httpaf.Reqd.t) : unit =
+let request_handler (index, scorer) _client_addr (reqd : Httpaf.Reqd.t) : unit =
   let req = Httpaf.Reqd.request reqd in
   match req.meth, req.target with
   | `GET, "/ready" ->
@@ -39,7 +72,7 @@ let request_handler index _client_addr (reqd : Httpaf.Reqd.t) : unit =
       try
         let json = Yojson.Safe.from_string (Buffer.contents buf) in
         let v = Fraud.Detect.vectorize json in
-        let score = Fraud.Index.fraud_score index v ~nprobe in
+        let score = Fraud.Index.fraud_score_with scorer index v ~nprobe in
         let approved = score < 0.6 in
         let body =
           Printf.sprintf "{\"approved\":%s,\"fraud_score\":%g}"
@@ -66,12 +99,12 @@ let main () =
   ] in
   Arg.parse speclist (fun _ -> ()) "fraud-server";
 
-  let index = load_index !index_path in
+  let bundle = load_index !index_path in
 
   let listen_addr = Unix.(ADDR_INET (inet_addr_any, !port)) in
   let connection_handler =
     Httpaf_lwt_unix.Server.create_connection_handler
-      ~request_handler:(request_handler index)
+      ~request_handler:(request_handler bundle)
       ~error_handler
   in
   Lwt_main.run begin

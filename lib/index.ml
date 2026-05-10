@@ -159,31 +159,59 @@ let build ?(c = 1024) ?(iters = 5) ?(sample = 200_000)
 let of_segments ~vecs ~n ~labels ~centroids ~c ~cell_offsets : t =
   { vecs; n; labels; centroids; c; cell_offsets }
 
-let fraud_score (idx : t) (q : float array) ~(nprobe : int) : float =
-  let cell_d = Array.make idx.c 0.0 in
-  for ci = 0 to idx.c - 1 do
-    cell_d.(ci) <- dist_vq idx.centroids ci q
-  done;
-  let cell_idx = Array.init idx.c (fun i -> i) in
-  Array.sort (fun a b -> compare cell_d.(a) cell_d.(b)) cell_idx;
+type scorer = {
+  top_d : float array;        (* nprobe smallest centroid dists, unsorted *)
+  top_ci : int array;         (* matching cell ids *)
+  out_idx : int array;        (* top-k vector ids *)
+  out_d : float array;        (* top-k vector dists *)
+  max_nprobe : int;
+}
 
-  let out_idx = Array.make k_neighbors (-1) in
-  let out_d = Array.make k_neighbors infinity in
+let create_scorer ~max_nprobe = {
+  top_d = Array.make max_nprobe infinity;
+  top_ci = Array.make max_nprobe 0;
+  out_idx = Array.make k_neighbors (-1);
+  out_d = Array.make k_neighbors infinity;
+  max_nprobe;
+}
+
+let fraud_score_with (s : scorer) (idx : t) (q : float array) ~(nprobe : int) : float =
+  let probe = min (min nprobe s.max_nprobe) idx.c in
+  (* partial-select probe smallest centroids: keep an unsorted top-`probe` set,
+     replace the current worst when a smaller one shows up. *)
+  for p = 0 to probe - 1 do s.top_d.(p) <- infinity; s.top_ci.(p) <- 0 done;
+  let worst_p = ref 0 in
+  let worst_v = ref infinity in
+  for ci = 0 to idx.c - 1 do
+    let d = dist_vq idx.centroids ci q in
+    if d < !worst_v then begin
+      s.top_d.(!worst_p) <- d;
+      s.top_ci.(!worst_p) <- ci;
+      let w = ref s.top_d.(0) and wp = ref 0 in
+      for j = 1 to probe - 1 do
+        if s.top_d.(j) > !w then begin w := s.top_d.(j); wp := j end
+      done;
+      worst_v := !w; worst_p := !wp
+    end
+  done;
+
+  for j = 0 to k_neighbors - 1 do
+    s.out_idx.(j) <- -1; s.out_d.(j) <- infinity
+  done;
   let worst = ref infinity in
   let worst_pos = ref 0 in
-  let probe = min nprobe idx.c in
   for p = 0 to probe - 1 do
-    let ci = cell_idx.(p) in
+    let ci = s.top_ci.(p) in
     let lo = Int64.to_int (Bigarray.Array1.unsafe_get idx.cell_offsets ci) in
     let hi = Int64.to_int (Bigarray.Array1.unsafe_get idx.cell_offsets (ci + 1)) in
     for vi = lo to hi - 1 do
       let dd = dist_vq idx.vecs vi q in
       if dd < !worst then begin
-        out_d.(!worst_pos) <- dd;
-        out_idx.(!worst_pos) <- vi;
-        let w = ref out_d.(0) and wp = ref 0 in
+        s.out_d.(!worst_pos) <- dd;
+        s.out_idx.(!worst_pos) <- vi;
+        let w = ref s.out_d.(0) and wp = ref 0 in
         for jj = 1 to k_neighbors - 1 do
-          if out_d.(jj) > !w then begin w := out_d.(jj); wp := jj end
+          if s.out_d.(jj) > !w then begin w := s.out_d.(jj); wp := jj end
         done;
         worst := !w; worst_pos := !wp
       end
@@ -192,8 +220,14 @@ let fraud_score (idx : t) (q : float array) ~(nprobe : int) : float =
 
   let frauds = ref 0 in
   for j = 0 to k_neighbors - 1 do
-    if out_idx.(j) >= 0
-       && Bigarray.Array1.unsafe_get idx.labels out_idx.(j) = '\001'
+    if s.out_idx.(j) >= 0
+       && Bigarray.Array1.unsafe_get idx.labels s.out_idx.(j) = '\001'
     then incr frauds
   done;
   float_of_int !frauds /. float_of_int k_neighbors
+
+(* Backwards-compatible wrapper that allocates a fresh scorer per call.
+   Kept for tests; the server uses [fraud_score_with] with a pooled scorer. *)
+let fraud_score (idx : t) (q : float array) ~(nprobe : int) : float =
+  let s = create_scorer ~max_nprobe:(min nprobe idx.c) in
+  fraud_score_with s idx q ~nprobe
