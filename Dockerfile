@@ -46,4 +46,6 @@ COPY --from=build /work/_build/default/bin/server/main.exe /app/server
 COPY --from=index /work/index.bin /app/index.bin
 
 EXPOSE 9999
+# Small minor heap + eager GC = shorter pauses under sustained load.
+ENV OCAMLRUNPARAM=s=2M,o=120
 ENTRYPOINT ["/app/server", "--index", "/app/index.bin", "--port", "9999"]

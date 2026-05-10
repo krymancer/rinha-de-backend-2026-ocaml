@@ -57,6 +57,29 @@ let respond_string reqd ?(status = `OK) ?(content_type = "text/plain") body =
   let resp = Httpaf.Response.create ~headers status in
   Httpaf.Reqd.respond_with_string reqd resp body
 
+(* Pre-rendered response strings, indexed by fraud count 0..k_neighbors.
+   fraud_score = frauds / 5, so the only six possible bodies are
+   approved=true for 0/1/2 and approved=false for 3/4/5. Building these
+   once at boot kills per-request String/Buffer allocation. *)
+let fraud_response_for : Httpaf.Response.t array =
+  let headers = Httpaf.Headers.of_list [
+    "content-type", "application/json";
+  ] in
+  Array.init 6 (fun frauds ->
+    let body = Printf.sprintf "{\"approved\":%s,\"fraud_score\":%g}"
+      (if frauds < 3 then "true" else "false")
+      (float_of_int frauds /. 5.0)
+    in
+    let h = Httpaf.Headers.add headers "content-length"
+              (string_of_int (String.length body)) in
+    Httpaf.Response.create ~headers:h `OK)
+
+let fraud_response_body : string array =
+  Array.init 6 (fun frauds ->
+    Printf.sprintf "{\"approved\":%s,\"fraud_score\":%g}"
+      (if frauds < 3 then "true" else "false")
+      (float_of_int frauds /. 5.0))
+
 let request_handler (index, scorer) _client_addr (reqd : Httpaf.Reqd.t) : unit =
   let req = Httpaf.Reqd.request reqd in
   match req.meth, req.target with
@@ -73,12 +96,10 @@ let request_handler (index, scorer) _client_addr (reqd : Httpaf.Reqd.t) : unit =
         let json = Yojson.Safe.from_string (Buffer.contents buf) in
         let v = Fraud.Detect.vectorize json in
         let score = Fraud.Index.fraud_score_with scorer index v ~nprobe in
-        let approved = score < 0.6 in
-        let body =
-          Printf.sprintf "{\"approved\":%s,\"fraud_score\":%g}"
-            (if approved then "true" else "false") score
-        in
-        respond_string reqd ~content_type:"application/json" body
+        let frauds = int_of_float (score *. 5.0 +. 0.5) in
+        let frauds = if frauds < 0 then 0 else if frauds > 5 then 5 else frauds in
+        Httpaf.Reqd.respond_with_string reqd
+          fraud_response_for.(frauds) fraud_response_body.(frauds)
       with e ->
         let msg = Printexc.to_string e in
         respond_string reqd ~status:`Bad_request ("error: " ^ msg)
@@ -102,10 +123,19 @@ let main () =
   let bundle = load_index !index_path in
 
   let listen_addr = Unix.(ADDR_INET (inet_addr_any, !port)) in
-  let connection_handler =
+  let inner_handler =
     Httpaf_lwt_unix.Server.create_connection_handler
       ~request_handler:(request_handler bundle)
       ~error_handler
+  in
+  (* Disable Nagle on every accepted connection. nginx -> api request/
+     response patterns interact badly with delayed-ACK and tail latency
+     spikes 40ms+ without this. *)
+  let connection_handler client_addr fd =
+    (try
+       Lwt_unix.setsockopt fd Lwt_unix.TCP_NODELAY true
+     with _ -> ());
+    inner_handler client_addr fd
   in
   Lwt_main.run begin
     Lwt_io.establish_server_with_client_socket listen_addr connection_handler
