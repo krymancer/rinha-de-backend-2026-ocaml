@@ -1,4 +1,4 @@
 (executable
  (name main)
- (libraries fraud yojson httpaf httpaf-lwt-unix lwt lwt.unix unix)
+ (libraries fraud unix)
  (ocamlopt_flags (:standard -O3 -unsafe)))

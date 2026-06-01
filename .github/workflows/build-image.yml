@@ -31,7 +31,7 @@ jobs:
           echo "image=ghcr.io/${{ github.repository }}" \
             | tr '[:upper:]' '[:lower:]' >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      - name: Build and push API
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -40,5 +40,18 @@ jobs:
           tags: |
             ${{ steps.tag.outputs.image }}:latest
             ${{ steps.tag.outputs.image }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push LB
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.lb
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.tag.outputs.image }}-lb:latest
+            ${{ steps.tag.outputs.image }}-lb:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

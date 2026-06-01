@@ -325,6 +325,83 @@ let vectorize_str (s : string) : float array =
   v.(13) <- clamp (me_avg /. max_merchant_avg_amount);
   v
 
+(* Zero-alloc variant: parse the body in place (starting at [base]) and write
+   i16-quantized values (SCALE=10000, matching Fraud.Knn.quantize) directly into
+   the reusable [out] array. No sub_string, no float array, no per-request alloc.
+   [s] is typically [Bytes.unsafe_to_string] of the connection buffer. *)
+let[@inline] qz x =
+  let x = if x < 0.0 then 0.0 else if x > 1.0 then 1.0 else x in
+  if x >= 1.0 then 10000 else int_of_float (Float.round (x *. 10000.0))
+
+let vectorize_q_into (s : string) (base : int) (out : int array) : unit =
+  let amount        = parse_float_at s (find_key_pos s "amount" base) in
+  let installments  = parse_int_at   s (find_key_pos s "installments" base) in
+  let req_at_pos    = find_key_pos s "requested_at" base in
+  let req_at_start, _ = parse_str_at s req_at_pos in
+
+  let cu_avg        = parse_float_at s (find_key_pos s "avg_amount" base) in
+  let cu_n24        = parse_int_at   s (find_key_pos s "tx_count_24h" base) in
+  let known_at      = find_key_pos s "known_merchants" base in
+
+  let me_pos        = find_key_pos s "merchant" base in
+  let me_id_pos     = find_key_pos s "id" me_pos in
+  let me_id_start, me_id_len = parse_str_at s me_id_pos in
+  let me_mcc_pos    = find_key_pos s "mcc" me_pos in
+  let me_mcc_start, me_mcc_len = parse_str_at s me_mcc_pos in
+  let me_avg        = parse_float_at s (find_key_pos s "avg_amount" me_pos) in
+
+  let te_pos        = find_key_pos s "terminal" base in
+  let te_online     = is_true_at s (find_key_pos s "is_online"     te_pos) in
+  let te_card       = is_true_at s (find_key_pos s "card_present"  te_pos) in
+  let te_kmh        = parse_float_at s (find_key_pos s "km_from_home" te_pos) in
+
+  let i k = Char.code (String.unsafe_get s k) - Char.code '0' in
+  let n2 a = i a * 10 + i (a+1) in
+  let n4 a = i a * 1000 + i (a+1) * 100 + i (a+2) * 10 + i (a+3) in
+  let y  = n4 (req_at_start) in
+  let mo = n2 (req_at_start + 5) in
+  let d  = n2 (req_at_start + 8) in
+  let hr = n2 (req_at_start + 11) in
+  let mi = n2 (req_at_start + 14) in
+  let se = n2 (req_at_start + 17) in
+  let dow = day_of_week y mo d in
+  let now_s = days_since_epoch y mo d * 86400 + hr * 3600 + mi * 60 + se in
+
+  Array.unsafe_set out 0 (qz (amount /. max_amount));
+  Array.unsafe_set out 1 (qz (float_of_int installments /. max_installments));
+  Array.unsafe_set out 2 (qz ((amount /. cu_avg) /. amount_vs_avg_ratio));
+  Array.unsafe_set out 3 (qz (float_of_int hr /. 23.0));
+  Array.unsafe_set out 4 (qz (float_of_int dow /. 6.0));
+
+  let lt_pos = find_key_pos s "last_transaction" base in
+  if lt_pos >= 0 && is_null_at s lt_pos then begin
+    Array.unsafe_set out 5 (-10000);
+    Array.unsafe_set out 6 (-10000)
+  end else begin
+    let ts_pos = find_key_pos s "timestamp" lt_pos in
+    let ts_start, _ = parse_str_at s ts_pos in
+    let ly  = n4 ts_start in
+    let lmo = n2 (ts_start + 5) in
+    let ld  = n2 (ts_start + 8) in
+    let lh  = n2 (ts_start + 11) in
+    let lmi = n2 (ts_start + 14) in
+    let lse = n2 (ts_start + 17) in
+    let last_s = days_since_epoch ly lmo ld * 86400 + lh * 3600 + lmi * 60 + lse in
+    let mins = float_of_int (now_s - last_s) /. 60.0 in
+    let kfc = parse_float_at s (find_key_pos s "km_from_current" lt_pos) in
+    Array.unsafe_set out 5 (qz (mins /. max_minutes));
+    Array.unsafe_set out 6 (qz (kfc /. max_km))
+  end;
+
+  Array.unsafe_set out 7 (qz (te_kmh /. max_km));
+  Array.unsafe_set out 8 (qz (float_of_int cu_n24 /. max_tx_count_24h));
+  Array.unsafe_set out 9  (if te_online then 10000 else 0);
+  Array.unsafe_set out 10 (if te_card   then 10000 else 0);
+  let known = known_array_contains s known_at me_id_start me_id_len in
+  Array.unsafe_set out 11 (if known then 0 else 10000);
+  Array.unsafe_set out 12 (qz (mcc_risk_slice s me_mcc_start me_mcc_len));
+  Array.unsafe_set out 13 (qz (me_avg /. max_merchant_avg_amount))
+
 (* Vectorize a parsed JSON payload into a fresh 14-element float array. *)
 let vectorize (j : Yojson.Safe.t) : float array =
   let v = Array.make 14 0.0 in

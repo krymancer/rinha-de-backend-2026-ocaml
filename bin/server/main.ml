@@ -1,146 +1,373 @@
-(* Fraud detection HTTP server — mmap'd index.bin. *)
+(* Raw fraud-detection HTTP server.
 
-open Lwt.Infix
+   No framework: a single-threaded epoll event loop, fixed per-connection
+   buffers, pipelined HTTP/1.1 parsing, pre-rendered responses, and the mmap'd
+   exact KD index (Fraud.Knn). The hot path allocates almost nothing, so under
+   the 0.45-CPU cgroup cap it stays under quota and avoids the CFS throttling
+   stalls that gave the old httpaf+Lwt server a ~45ms p99.
 
-let nprobe = 4
+   epoll (not Unix.select) is used because select rebuilds fd_sets and
+   allocates lists every call, capping single-core throughput.
+
+   Topology: each worker binds :9999 with SO_REUSEPORT; run N workers (fork) so
+   the kernel load-balances connections across them with no proxy hop. *)
+
+module K = Fraud.Knn
+module E = Fraud.Epoll
+
+let dim = K.dim
+
+(* ---- config ---- *)
 let port = ref 9999
 let index_path = ref "/app/index.bin"
 let socket_path = ref ""
+let fd_uds = ref ""          (* SEQPACKET unix socket: receive client fds from the LB *)
+let reuseport = ref true
+let workers = ref 1
+let warmup = ref 0
 
-let load_index path : Fraud.Index.t * Fraud.Index.scorer =
-  let t0 = Unix.gettimeofday () in
-  let h, v = Fraud.Index_io.load_mmap path in
-  let idx = Fraud.Index.of_segments
-    ~vecs:v.vecs ~n:h.n ~labels:v.labels
-    ~centroids:v.centroids ~c:h.c ~cell_offsets:v.cell_offsets in
-  let scorer = Fraud.Index.create_scorer ~max_nprobe:nprobe in
-  Printf.printf "[server] mmapped index n=%d c=%d in %.3fs from %s\n%!"
-    h.n h.c (Unix.gettimeofday () -. t0) path;
-  idx, scorer
+(* ---- pre-rendered responses ---- *)
+let http_resp body =
+  Bytes.of_string
+    (Printf.sprintf
+       "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s"
+       (String.length body) body)
 
-let respond_string reqd ?(status = `OK) ?(content_type = "text/plain") body =
-  let headers = Httpaf.Headers.of_list [
-    "content-type", content_type;
-    "content-length", string_of_int (String.length body);
-  ] in
-  let resp = Httpaf.Response.create ~headers status in
-  Httpaf.Reqd.respond_with_string reqd resp body
+let fraud_responses =
+  Array.init 6 (fun c ->
+    let approved = if c < 3 then "true" else "false" in
+    let score = [| "0"; "0.2"; "0.4"; "0.6"; "0.8"; "1" |].(c) in
+    http_resp (Printf.sprintf "{\"approved\":%s,\"fraud_score\":%s}" approved score))
 
-(* Pre-rendered response strings, indexed by fraud count 0..k_neighbors.
-   fraud_score = frauds / 5, so the only six possible bodies are
-   approved=true for 0/1/2 and approved=false for 3/4/5. Building these
-   once at boot kills per-request String/Buffer allocation. *)
-let fraud_response_for : Httpaf.Response.t array =
-  let headers = Httpaf.Headers.of_list [
-    "content-type", "application/json";
-  ] in
-  Array.init 6 (fun frauds ->
-    let body = Printf.sprintf "{\"approved\":%s,\"fraud_score\":%g}"
-      (if frauds < 3 then "true" else "false")
-      (float_of_int frauds /. 5.0)
-    in
-    let h = Httpaf.Headers.add headers "content-length"
-              (string_of_int (String.length body)) in
-    Httpaf.Response.create ~headers:h `OK)
+let ready_resp =
+  Bytes.of_string "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok"
 
-let fraud_response_body : string array =
-  Array.init 6 (fun frauds ->
-    Printf.sprintf "{\"approved\":%s,\"fraud_score\":%g}"
-      (if frauds < 3 then "true" else "false")
-      (float_of_int frauds /. 5.0))
+let bad_resp =
+  Bytes.of_string "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
-let request_handler (index, scorer) _client_addr (reqd : Httpaf.Reqd.t) : unit =
-  let req = Httpaf.Reqd.request reqd in
-  match req.meth, req.target with
-  | `GET, "/ready" ->
-    respond_string reqd "ok"
-  | `POST, "/fraud-score" ->
-    let body_r = Httpaf.Reqd.request_body reqd in
-    (* DIAGNOSTIC: read body to keep keepalive happy but skip parse + kNN.
-       Always reply approved=true. Detection cut will trigger; we want
-       p99_score in isolation to attribute the 80ms tail. *)
-    ignore index; ignore scorer;
-    let rec on_read _bs ~off:_ ~len:_ =
-      Httpaf.Body.schedule_read body_r ~on_read ~on_eof
-    and on_eof () =
-      Httpaf.Reqd.respond_with_string reqd
-        fraud_response_for.(0) fraud_response_body.(0)
-    in
-    Httpaf.Body.schedule_read body_r ~on_read ~on_eof
-  | _ ->
-    respond_string reqd ~status:`Not_found "not found"
+(* ---- connection state ---- *)
+let buf_cap = 16384
 
-let error_handler _client_addr ?request:_ _err start_response =
-  let body = start_response Httpaf.Headers.empty in
-  Httpaf.Body.write_string body "internal error";
-  Httpaf.Body.close_writer body
+type conn = {
+  fd : Unix.file_descr;
+  ifd : int;
+  inbuf : Bytes.t;
+  mutable inlen : int;
+  mutable outbuf : Bytes.t;
+  mutable outpos : int;
+  mutable outlen : int;
+  mutable want_write : bool;
+}
 
-(* Standalone client mode used as the docker healthcheck: connects to the
-   given unix socket, sends GET /ready, exits 0 if response starts with
-   "HTTP/1.1 200" else 1. Lives in the same binary so the runtime image
-   doesn't need curl/socat. *)
-let healthcheck_mode path =
-  let fd = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
-  let ok =
-    try
-      Unix.connect fd (Unix.ADDR_UNIX path);
-      let req = "GET /ready HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" in
-      let _ = Unix.write_substring fd req 0 (String.length req) in
-      let buf = Bytes.create 64 in
-      let n = Unix.read fd buf 0 (Bytes.length buf) in
-      n >= 12 && Bytes.sub_string buf 0 12 = "HTTP/1.1 200"
-    with _ -> false
+let new_conn fd ifd = {
+  fd; ifd;
+  inbuf = Bytes.create buf_cap;
+  inlen = 0;
+  outbuf = Bytes.create 4096;
+  outpos = 0;
+  outlen = 0;
+  want_write = false;
+}
+
+let[@inline] lc c = if c >= 'A' && c <= 'Z' then Char.chr (Char.code c + 32) else c
+
+(* ---- per-worker serve loop ---- *)
+let serve () =
+  let idx = K.load ~path:!index_path in
+  Printf.eprintf "[server] loaded index n=%d nodes=%d\n%!"
+    idx.K.n (Array.length idx.K.node_left);
+  let scratch = K.create_scratch () in
+  let q = Array.make dim 0 in
+
+  if !warmup > 0 then begin
+    let n = idx.K.n in
+    for i = 0 to !warmup - 1 do
+      let src = (i * 2654435761) land max_int mod (max 1 n) in
+      for d = 0 to dim - 1 do
+        q.(d) <- Bigarray.Array1.unsafe_get idx.K.vecs (src * dim + d)
+      done;
+      ignore (K.fraud_count_with scratch idx q ~exact:false)
+    done;
+    Printf.eprintf "[server] warmed up %d queries\n%!" !warmup
+  end;
+
+  let fd_pass = !fd_uds <> "" in
+  let listen_fd, label =
+    if fd_pass then begin
+      (* SEQPACKET unix socket: the LB connects and passes client fds over it *)
+      (try Unix.unlink !fd_uds with _ -> ());
+      let fd = Unix.socket Unix.PF_UNIX Unix.SOCK_SEQPACKET 0 in
+      Unix.bind fd (Unix.ADDR_UNIX !fd_uds);
+      Unix.listen fd 8;
+      (try Unix.chmod !fd_uds 0o666 with _ -> ());
+      fd, "fd-uds:" ^ !fd_uds
+    end
+    else if !socket_path <> "" then begin
+      (try Unix.unlink !socket_path with _ -> ());
+      let fd = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+      Unix.bind fd (Unix.ADDR_UNIX !socket_path);
+      Unix.listen fd 1024;
+      (try Unix.chmod !socket_path 0o666 with _ -> ());
+      fd, "unix:" ^ !socket_path
+    end else begin
+      let fd = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+      Unix.setsockopt fd Unix.SO_REUSEADDR true;
+      if !reuseport then (try Unix.setsockopt fd Unix.SO_REUSEPORT true with _ -> ());
+      Unix.bind fd (Unix.ADDR_INET (Unix.inet_addr_any, !port));
+      Unix.listen fd 1024;
+      fd, Printf.sprintf "tcp::%d" !port
+    end
   in
-  (try Unix.close fd with _ -> ());
-  exit (if ok then 0 else 1)
+  Unix.set_nonblock listen_fd;
+  let lfd_int = E.int_of_fd listen_fd in
+  let epfd = E.create1 () in
+  E.add epfd lfd_int E.in_;
+  Printf.eprintf "[server] listening on %s (epoll)\n%!" label;
 
+  let conns : (int, conn) Hashtbl.t = Hashtbl.create 4096 in
+  let ctrls : (int, unit) Hashtbl.t = Hashtbl.create 8 in
+
+  let close_conn c =
+    (try E.del epfd c.ifd with _ -> ());
+    (try Unix.close c.fd with _ -> ());
+    Hashtbl.remove conns c.ifd
+  in
+
+  let ensure_out c need =
+    let cap = Bytes.length c.outbuf in
+    if c.outlen + need > cap then begin
+      let ncap = ref (cap * 2) in
+      while c.outlen + need > !ncap do ncap := !ncap * 2 done;
+      let nb = Bytes.create !ncap in
+      Bytes.blit c.outbuf 0 nb 0 c.outlen;
+      c.outbuf <- nb
+    end
+  in
+  let append_resp c (r : Bytes.t) =
+    let len = Bytes.length r in
+    ensure_out c len;
+    Bytes.blit r 0 c.outbuf c.outlen len;
+    c.outlen <- c.outlen + len
+  in
+
+  (* flush pending output; returns false if the conn died *)
+  let flush c =
+    let alive = ref true and again = ref true in
+    while !again && c.outpos < c.outlen do
+      match Unix.write c.fd c.outbuf c.outpos (c.outlen - c.outpos) with
+      | 0 -> again := false
+      | n -> c.outpos <- c.outpos + n
+      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> again := false
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> ()
+      | exception _ -> alive := false; again := false
+    done;
+    if not !alive then false
+    else begin
+      if c.outpos >= c.outlen then begin
+        c.outpos <- 0; c.outlen <- 0;
+        if c.want_write then (c.want_write <- false; (try E.modify epfd c.ifd E.in_ with _ -> ()))
+      end else if not c.want_write then
+        (c.want_write <- true; (try E.modify epfd c.ifd (E.in_ lor E.out) with _ -> ()));
+      true
+    end
+  in
+
+  (* handle one request at inbuf[start..]; consumed bytes, or -1 need, -2 close *)
+  let handle_request c start =
+    let buf = c.inbuf in
+    let len = c.inlen - start in
+    let sub off = start + off in
+    let he =
+      let i = ref (sub 3) and res = ref (-1) in
+      while !res < 0 && !i < c.inlen do
+        if Bytes.unsafe_get buf !i = '\n'
+           && Bytes.unsafe_get buf (!i - 1) = '\r'
+           && Bytes.unsafe_get buf (!i - 2) = '\n'
+           && Bytes.unsafe_get buf (!i - 3) = '\r'
+        then res := !i + 1 else incr i
+      done;
+      !res
+    in
+    if he < 0 then (if len > buf_cap - 1 then -2 else -1)
+    else begin
+      let get o = Bytes.unsafe_get buf (sub o) in
+      if get 0 = 'G' then (append_resp c ready_resp; he - start)
+      else if get 0 = 'P' then begin
+        let cl =
+          let needle = "content-length:" in
+          let nl = String.length needle in
+          let i = ref start and found = ref (-1) in
+          while !found < 0 && !i + nl <= he do
+            let m = ref true and j = ref 0 in
+            while !m && !j < nl do
+              if lc (Bytes.unsafe_get buf (!i + !j)) <> String.unsafe_get needle !j then m := false;
+              incr j
+            done;
+            if !m then begin
+              let p = ref (!i + nl) in
+              while !p < he && (Bytes.unsafe_get buf !p = ' ' || Bytes.unsafe_get buf !p = '\t') do incr p done;
+              let v = ref 0 and any = ref false in
+              while !p < he && (let ch = Bytes.unsafe_get buf !p in ch >= '0' && ch <= '9') do
+                v := !v * 10 + (Char.code (Bytes.unsafe_get buf !p) - Char.code '0'); any := true; incr p
+              done;
+              found := if !any then !v else 0
+            end;
+            incr i
+          done;
+          !found
+        in
+        if cl < 0 then (append_resp c bad_resp; he - start)
+        else begin
+          let body_end = he + cl in
+          if c.inlen < body_end then -1
+          else begin
+            (* zero-alloc: parse the body slice in place into the reused q *)
+            Fraud.Detect.vectorize_q_into (Bytes.unsafe_to_string buf) he q;
+            let count = K.fraud_count_with scratch idx q ~exact:false in
+            append_resp c (Array.unsafe_get fraud_responses count);
+            body_end - start
+          end
+        end
+      end
+      else (append_resp c bad_resp; he - start)
+    end
+  in
+
+  let handle_readable c =
+    let alive = ref true and again = ref true in
+    (* drain the socket *)
+    while !again do
+      match Unix.read c.fd c.inbuf c.inlen (buf_cap - c.inlen) with
+      | 0 -> alive := false; again := false
+      | n -> c.inlen <- c.inlen + n;
+             if c.inlen >= buf_cap then again := false  (* full: stop, parse *)
+      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> again := false
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> ()
+      | exception _ -> alive := false; again := false
+    done;
+    if not !alive && c.inlen = 0 then close_conn c
+    else begin
+      let pos = ref 0 and stop = ref false and dead = ref false in
+      while not !stop && !pos < c.inlen do
+        let consumed = handle_request c !pos in
+        if consumed = -1 then stop := true
+        else if consumed = -2 then (dead := true; stop := true)
+        else pos := !pos + consumed
+      done;
+      if !dead then close_conn c
+      else begin
+        if !pos > 0 then begin
+          let rem = c.inlen - !pos in
+          if rem > 0 then Bytes.blit c.inbuf !pos c.inbuf 0 rem;
+          c.inlen <- rem
+        end;
+        if not (flush c) then close_conn c
+        else if not !alive then close_conn c   (* peer closed after final req *)
+      end
+    end
+  in
+
+  let register_client fd =
+    Unix.set_nonblock fd;
+    (try Unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
+    let ifd = E.int_of_fd fd in
+    Hashtbl.replace conns ifd (new_conn fd ifd);
+    (try E.add epfd ifd E.in_
+     with _ -> (try Unix.close fd with _ -> ()); Hashtbl.remove conns ifd)
+  in
+
+  (* TCP / unix-stream mode: accept client connections directly. *)
+  let accept_all () =
+    let again = ref true in
+    while !again do
+      match Unix.accept ~cloexec:true listen_fd with
+      | (fd, _) -> register_client fd
+      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> again := false
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> ()
+      | exception _ -> again := false
+    done
+  in
+
+  (* fd-pass mode: accept the LB's SEQPACKET control connection(s). *)
+  let accept_ctrls () =
+    let again = ref true in
+    while !again do
+      match Unix.accept ~cloexec:true listen_fd with
+      | (fd, _) ->
+        Unix.set_nonblock fd;
+        let ifd = E.int_of_fd fd in
+        Hashtbl.replace ctrls ifd ();
+        (try E.add epfd ifd E.in_
+         with _ -> (try Unix.close fd with _ -> ()); Hashtbl.remove ctrls ifd)
+      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> again := false
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> ()
+      | exception _ -> again := false
+    done
+  in
+
+  (* fd-pass mode: drain passed client fds off a control connection. *)
+  let recv_clients ctrl_ifd =
+    let again = ref true in
+    while !again do
+      let r = E.recv_fd ctrl_ifd in
+      if r >= 0 then register_client (E.fd_of_int r)
+      else if r = -1 then again := false
+      else begin
+        (try E.del epfd ctrl_ifd with _ -> ());
+        (try Unix.close (E.fd_of_int ctrl_ifd) with _ -> ());
+        Hashtbl.remove ctrls ctrl_ifd;
+        again := false
+      end
+    done
+  in
+
+  let maxev = 1024 in
+  let out_fds = Array.make maxev 0 and out_evs = Array.make maxev 0 in
+  while true do
+    let n = E.wait epfd out_fds out_evs (-1) in
+    for i = 0 to n - 1 do
+      let fd = Array.unsafe_get out_fds i in
+      let ev = Array.unsafe_get out_evs i in
+      if fd = lfd_int then (if fd_pass then accept_ctrls () else accept_all ())
+      else if fd_pass && Hashtbl.mem ctrls fd then recv_clients fd
+      else match Hashtbl.find_opt conns fd with
+        | None -> ()
+        | Some c ->
+          if ev land (E.err lor E.hup) <> 0 && ev land E.in_ = 0 then close_conn c
+          else begin
+            if ev land E.in_ <> 0 then handle_readable c;
+            if ev land E.out <> 0 && Hashtbl.mem conns fd then
+              (if not (flush c) then close_conn c)
+          end
+    done
+  done
+
+(* ---- entry ---- *)
 let main () =
-  let healthcheck = ref "" in
   let speclist = [
-    "--port",   Arg.Set_int port,           "TCP port (default 9999, ignored if --socket given)";
-    "--socket", Arg.Set_string socket_path, "Unix socket path (skips TCP listener)";
-    "--index",  Arg.Set_string index_path,  "path to index.bin (default /app/index.bin)";
-    "--healthcheck", Arg.Set_string healthcheck, "probe given unix socket and exit 0/1";
+    "--port", Arg.Set_int port, "TCP port (default 9999)";
+    "--socket", Arg.Set_string socket_path, "unix socket path (HTTP over unix, overrides TCP)";
+    "--fd-uds", Arg.Set_string fd_uds, "SEQPACKET unix socket: receive client fds from the LB";
+    "--index", Arg.Set_string index_path, "path to index.bin";
+    "--no-reuseport", Arg.Clear reuseport, "disable SO_REUSEPORT";
+    "--workers", Arg.Set_int workers, "SO_REUSEPORT worker processes (default 1)";
+    "--warmup", Arg.Set_int warmup, "warmup query count before serving";
   ] in
   Arg.parse speclist (fun _ -> ()) "fraud-server";
 
-  if !healthcheck <> "" then healthcheck_mode !healthcheck;
+  (match Sys.getenv_opt "INDEX_PATH" with Some p when p <> "" -> index_path := p | _ -> ());
+  (match Sys.getenv_opt "FD_UDS" with Some p when p <> "" -> fd_uds := p | _ -> ());
+  (match Sys.getenv_opt "API_WORKERS" with Some w -> (try workers := int_of_string w with _ -> ()) | _ -> ());
+  (match Sys.getenv_opt "API_WARMUP_QUERIES" with Some w -> (try warmup := int_of_string w with _ -> ()) | _ -> ());
 
-  let env_socket = try Sys.getenv "SOCKET_PATH" with Not_found -> "" in
-  if !socket_path = "" && env_socket <> "" then socket_path := env_socket;
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
 
-  let bundle = load_index !index_path in
-
-  let listen_addr, listen_label =
-    if !socket_path <> "" then begin
-      (try Unix.unlink !socket_path with Unix.Unix_error _ -> ());
-      Unix.(ADDR_UNIX !socket_path), "unix:" ^ !socket_path
-    end else
-      Unix.(ADDR_INET (inet_addr_any, !port)), Printf.sprintf "tcp::%d" !port
-  in
-  let inner_handler =
-    Httpaf_lwt_unix.Server.create_connection_handler
-      ~request_handler:(request_handler bundle)
-      ~error_handler
-  in
-  (* Disable Nagle on every accepted TCP connection. Unix sockets ignore
-     TCP_NODELAY (setsockopt fails with ENOPROTOOPT) so we swallow the
-     error. *)
-  let connection_handler client_addr fd =
-    (try
-       Lwt_unix.setsockopt fd Lwt_unix.TCP_NODELAY true
-     with _ -> ());
-    inner_handler client_addr fd
-  in
-  Lwt_main.run begin
-    Lwt_io.establish_server_with_client_socket listen_addr connection_handler
-    >>= fun _server ->
-    if !socket_path <> "" then begin
-      (* nginx in another container needs to read+write the socket. *)
-      try Unix.chmod !socket_path 0o666 with _ -> ()
-    end;
-    Printf.printf "[server] listening on %s\n%!" listen_label;
-    fst (Lwt.wait ())
-  end
+  let n = max 1 !workers in
+  for _ = 2 to n do
+    match Unix.fork () with
+    | 0 -> serve ()
+    | _ -> ()
+  done;
+  serve ()
 
 let () = main ()

@@ -2,6 +2,6 @@
     "participants": ["Junior Nascimento"],
     "social": ["https://github.com/krymancer"],
     "source-code-repo": "https://github.com/krymancer/rinha-de-backend-2026-ocaml",
-    "stack": ["ocaml", "httpaf", "lwt", "nginx"],
+    "stack": ["ocaml", "epoll", "kd-tree", "c"],
     "open_to_work": false
 }

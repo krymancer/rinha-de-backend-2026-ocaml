@@ -155,21 +155,22 @@ let test_build_produces_sorted_layout () =
   Alcotest.(check int64) "first offset = 0" 0L (Bigarray.Array1.get idx.cell_offsets 0);
   Alcotest.(check int64) "last offset = n" (Int64.of_int n) (Bigarray.Array1.get idx.cell_offsets 4)
 
+(* e2e: build_index (KD format) -> Knn.load -> a query returns a valid count *)
 let test_build_index_e2e () =
   let bin = "../bin/build_index.exe" in
   let in_  = "./fixtures/example-references.json" in
   let out_ = Filename.temp_file "idx_e2e_" ".bin" in
   let finally () = try Sys.remove out_ with _ -> () in
   Fun.protect ~finally (fun () ->
-    let cmd = Printf.sprintf
-      "%s --in %s --out %s --c 4 --iters 3 --sample 100 2>/dev/null"
+    let cmd = Printf.sprintf "%s --in %s --out %s 2>/dev/null"
       (Filename.quote bin) (Filename.quote in_) (Filename.quote out_) in
     let rc = Sys.command cmd in
     Alcotest.(check int) "build_index exit 0" 0 rc;
-    let h, _v = Index_io.load_mmap out_ in
-    Alcotest.(check int) "c" 4 h.c;
-    Alcotest.(check int) "dim" 14 h.dim;
-    Alcotest.(check bool) "n > 0" true (h.n > 0))
+    let idx = Knn.load ~path:out_ in
+    Alcotest.(check int) "n = 100" 100 idx.Knn.n;
+    let q = Array.make Knn.dim 0 in
+    let c = Knn.fraud_count idx q ~exact:true in
+    Alcotest.(check bool) "fraud count in [0,5]" true (c >= 0 && c <= 5))
 
 let () =
   Alcotest.run "index_io" [
@@ -191,7 +192,7 @@ let () =
         `Quick test_build_produces_sorted_layout;
     ];
     "build_index", [
-      Alcotest.test_case "e2e: example-references → index.bin" `Quick
+      Alcotest.test_case "e2e: example-references → KD index → query" `Quick
         test_build_index_e2e;
     ];
   ]

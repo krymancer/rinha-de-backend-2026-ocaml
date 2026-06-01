@@ -1,87 +1,65 @@
-(* Read references JSON (gzipped via stdin pipe or plain file),
-   build IVF index, write index.bin. *)
+(* Read references JSON (gzipped via stdin pipe or plain file), build the exact
+   partition+KD-tree index (Fraud.Knn) and write it to index.bin.
+
+   Runs in the unconstrained build container, so the transient memory of the
+   in-RAM build is fine; the runtime server only mmaps the result. *)
 
 open Fraud
 
-let in_path = ref "-"        (* "-" means stdin *)
+let in_path = ref "-"
 let out_path = ref "index.bin"
-let cells = ref 1024
-let iters = ref 5
-let sample = ref 200_000
-let nprobe_default = ref 8
 
 let speclist = [
   "--in",  Arg.Set_string in_path,
     "input references.json path or '-' for stdin (default '-')";
   "--out", Arg.Set_string out_path, "output index.bin path (default index.bin)";
-  "--c",   Arg.Set_int cells, "IVF cells (default 1024)";
-  "--iters", Arg.Set_int iters, "k-means iters (default 5)";
-  "--sample", Arg.Set_int sample, "k-means sample size (default 200_000)";
-  "--nprobe", Arg.Set_int nprobe_default, "default nprobe written into header (default 8)";
+  (* accepted-but-ignored legacy IVF flags so existing invocations don't break *)
+  "--c", Arg.Int ignore, "(ignored) legacy IVF cells";
+  "--iters", Arg.Int ignore, "(ignored) legacy k-means iters";
+  "--sample", Arg.Int ignore, "(ignored) legacy k-means sample";
+  "--nprobe", Arg.Int ignore, "(ignored) legacy nprobe";
 ]
 
-(* For simplicity in v1, we use a list buffer of (float array * label).
-   Memory peak ~360-460 MB for 3M records — acceptable in unconstrained
-   build container. *)
-
-let read_all_records src =
-  let recs = ref [] in
-  let count = ref 0 in
-  let t0 = Unix.gettimeofday () in
-  Refs_reader.fold (fun () (vec, label) ->
-    recs := (vec, label) :: !recs;
-    incr count;
-    if !count mod 100_000 = 0 then
-      Printf.eprintf "[build_index] read %d records in %.2fs\n%!"
-        !count (Unix.gettimeofday () -. t0)
-  ) () src;
-  Printf.eprintf "[build_index] total records: %d in %.2fs\n%!"
-    !count (Unix.gettimeofday () -. t0);
-  List.rev !recs, !count
-
-let to_bigarrays (recs : (float array * Refs_reader.label) list) (n : int) =
-  let dim = Index.dim in
-  let vecs = Bigarray.Array1.create Bigarray.float32 Bigarray.c_layout (n * dim) in
-  let labels = Bytes.create n in
-  List.iteri (fun i (v, l) ->
-    for o = 0 to dim - 1 do
-      Bigarray.Array1.unsafe_set vecs (i * dim + o) v.(o)
-    done;
-    Bytes.unsafe_set labels i (match l with `Fraud -> '\001' | `Legit -> '\000')
-  ) recs;
-  vecs, labels
+let now () = Unix.gettimeofday ()
 
 let main () =
   Arg.parse speclist (fun _ -> ()) "build_index";
   let src : Refs_reader.source =
     if !in_path = "-" then Refs_reader.Stdin else Refs_reader.File !in_path
   in
-  Printf.eprintf "[build_index] reading from %s, writing to %s\n%!"
-    (if !in_path = "-" then "<stdin>" else !in_path) !out_path;
-  let recs, n = read_all_records src in
-  let vecs, labels = to_bigarrays recs n in
-  Printf.eprintf "[build_index] building IVF c=%d iters=%d sample=%d\n%!"
-    !cells !iters !sample;
-  let t0 = Unix.gettimeofday () in
-  let idx = Index.build ~c:!cells ~iters:!iters ~sample:!sample
-              vecs n labels in
-  Printf.eprintf "[build_index] IVF built in %.2fs\n%!"
-    (Unix.gettimeofday () -. t0);
+  Printf.eprintf "[build_index] reading from %s\n%!"
+    (if !in_path = "-" then "<stdin>" else !in_path);
 
-  let header = Index_io.plan_layout
-    ~n:idx.n ~c:idx.c ~dim:Index.dim ~nprobe_default:!nprobe_default in
-  (* labels in idx are a Bigarray; rebuild a Bytes buffer for save *)
-  let labels_b = Bytes.create idx.n in
-  for i = 0 to idx.n - 1 do
-    Bytes.unsafe_set labels_b i (Bigarray.Array1.unsafe_get idx.labels i)
-  done;
-  Printf.eprintf "[build_index] writing %s (%d MB)\n%!"
-    !out_path (header.file_size / (1024 * 1024));
-  Index_io.save ~path:!out_path ~header
-    ~centroids:idx.centroids
-    ~cell_offsets:idx.cell_offsets
-    ~vecs:idx.vecs
-    ~labels:labels_b;
-  Printf.eprintf "[build_index] done\n%!"
+  (* Read + quantize into a flat store. *)
+  let t0 = now () in
+  let recs = ref [] and count = ref 0 in
+  Refs_reader.fold (fun () (v, l) ->
+    recs := (v, l) :: !recs;
+    incr count;
+    if !count mod 500_000 = 0 then
+      Printf.eprintf "[build_index] read %d in %.1fs\n%!" !count (now () -. t0)
+  ) () src;
+  let n = !count in
+  let recs = Array.of_list (List.rev !recs) in
+  Printf.eprintf "[build_index] %d refs read in %.1fs\n%!" n (now () -. t0);
+
+  let dim = Knn.dim in
+  let store = Array.make (max 1 (n * dim)) 0 in
+  let labels = Array.make (max 1 n) 0 in
+  Array.iteri (fun i (v, l) ->
+    for d = 0 to dim - 1 do store.(i * dim + d) <- Knn.quantize v.(d) done;
+    labels.(i) <- (match l with `Fraud -> 1 | `Legit -> 0)
+  ) recs;
+
+  let tb = now () in
+  let idx = Knn.build ~n
+    ~get:(fun p d -> Array.unsafe_get store (p * dim + d))
+    ~label:(fun p -> Array.unsafe_get labels p) in
+  Printf.eprintf "[build_index] KD index built in %.1fs (%d nodes)\n%!"
+    (now () -. tb) (Array.length idx.Knn.node_left);
+
+  Knn.save idx ~path:!out_path;
+  let sz = (Unix.stat !out_path).Unix.st_size in
+  Printf.eprintf "[build_index] wrote %s (%d MB)\n%!" !out_path (sz / (1024 * 1024))
 
 let () = main ()

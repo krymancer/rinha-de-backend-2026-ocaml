@@ -1,5 +1,5 @@
 (tests
- (names test_smoke test_index_io test_refs_reader)
+ (names test_smoke test_index_io test_refs_reader test_knn)
  (libraries fraud alcotest)
  (deps (glob_files fixtures/*.json)
        ../bin/build_index.exe))

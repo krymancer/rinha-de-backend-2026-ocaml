@@ -1,0 +1,11 @@
+# Forward-only fd-passing load balancer.
+FROM debian:12-slim AS build
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && \
+    rm -rf /var/lib/apt/lists/*
+COPY lb/fd_lb.c /fd_lb.c
+RUN gcc -O2 -Wall -o /fd_lb /fd_lb.c
+
+FROM debian:12-slim
+COPY --from=build /fd_lb /usr/local/bin/fd_lb
+EXPOSE 9999
+ENTRYPOINT ["/usr/local/bin/fd_lb"]

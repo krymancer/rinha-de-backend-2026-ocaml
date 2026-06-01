@@ -1,4 +1,4 @@
 (executables
- (names bench bench_int8 bench_ivf build_index)
+ (names bench bench_int8 bench_ivf build_index bench_knn)
  (libraries fraud unix yojson)
  (ocamlopt_flags (:standard -O3 -unsafe)))
