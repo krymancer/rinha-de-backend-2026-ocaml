@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ---------- Stage 1: build OCaml binaries ----------
-FROM ocaml/opam:debian-12-ocaml-5.1 AS build
+FROM ocaml/opam:debian-12-ocaml-5.1-flambda AS build
 WORKDIR /work
 
 USER root
@@ -11,12 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 USER opam
 
 # Server is framework-free now (raw epoll); only dune + yojson needed.
-# ocaml-option-flambda recompiles the switch's compiler with flambda, so the
-# `-O3` / `[@inline]` in lib/dune actually fire (without it they are silent
-# no-ops): ref->register in the kNN hot loops + cross-module inlining of the
-# distance/scan code. ~1.5-2x on the scalar numeric path.
-RUN opam update -y && opam install -y ocaml-option-flambda
-RUN opam install -y dune yojson
+# The base image's default switch is already flambda (the -flambda tag), so the
+# `-O3` / [@inline] in lib/dune fire: ref->register in the kNN hot loops +
+# cross-module inlining of the distance/scan code. Asserted at build below.
+RUN opam update -y && opam install -y dune yojson
 
 COPY --chown=opam:opam dune-project ./
 COPY --chown=opam:opam lib lib
