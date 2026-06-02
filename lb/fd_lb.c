@@ -5,7 +5,7 @@
    The backend then reads/writes the client directly, so the LB is out of the
    data path entirely — no proxying, no payload inspection, no extra hop.
 
-   Round-robins across backends. Adapted from the reference design. */
+   Round-robins across backends. */
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>

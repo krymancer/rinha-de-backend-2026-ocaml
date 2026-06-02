@@ -8,7 +8,7 @@
        ordering is therefore identical to the float brute-force used to label
        the test set -> detection is exact, not approximate.
 
-   Speed comes from the same structure rafaelcoelhox/detecta-fraude uses:
+   Speed comes from a two-level spatial index:
      - Partition the references into <=256 buckets by a key built from the
        discrete dimensions (presence of last_tx, is_online, card_present,
        unknown_merchant, mcc bucket, amount-vs-avg high, tx_count high).
