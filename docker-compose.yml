@@ -5,6 +5,7 @@ services:
       context: .
       dockerfile: Dockerfile
     platform: linux/amd64
+    cpuset: "0"          # pin to a dedicated core: kills scheduler-migration jitter
     environment:
       INDEX_PATH: /app/index.bin
       FD_UDS: /sockets/api1.sock
@@ -19,6 +20,7 @@ services:
 
   api2:
     <<: *api
+    cpuset: "1"          # dedicated core, separate from api1 and the LB
     environment:
       INDEX_PATH: /app/index.bin
       FD_UDS: /sockets/api2.sock
@@ -30,6 +32,7 @@ services:
       context: .
       dockerfile: Dockerfile.lb
     platform: linux/amd64
+    cpuset: "2,3"        # LB gets its own cores; never contends with the APIs
     ports: ["9999:9999"]
     environment:
       LB_PORT: "9999"

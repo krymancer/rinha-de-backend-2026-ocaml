@@ -11,13 +11,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 USER opam
 
 # Server is framework-free now (raw epoll); only dune + yojson needed.
-RUN opam update -y && opam install -y dune yojson
+# ocaml-option-flambda recompiles the switch's compiler with flambda, so the
+# `-O3` / `[@inline]` in lib/dune actually fire (without it they are silent
+# no-ops): ref->register in the kNN hot loops + cross-module inlining of the
+# distance/scan code. ~1.5-2x on the scalar numeric path.
+RUN opam update -y && opam install -y ocaml-option-flambda
+RUN opam install -y dune yojson
 
 COPY --chown=opam:opam dune-project ./
 COPY --chown=opam:opam lib lib
 COPY --chown=opam:opam bin bin
 
-RUN eval $(opam env) && dune build --release bin/build_index.exe bin/server/main.exe
+RUN eval $(opam env) && ocamlopt -config | grep -qx 'flambda: true' \
+ && echo "flambda: ON" \
+ && dune build --release bin/build_index.exe bin/server/main.exe
 
 # ---------- Stage 2: build index.bin (exact KD index) ----------
 FROM debian:12-slim AS index

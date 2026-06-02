@@ -75,8 +75,24 @@ let[@inline] partition_key_of (get : int -> int) : int =
   if get 8 > 2048 then key := !key lor (1 lsl 7);
   !key
 
-let partition_key (q : int array) : int =
-  partition_key_of (fun d -> Array.unsafe_get q d)
+(* Query-time partition key: same logic as [partition_key_of] but reads [q]
+   directly. Passing a closure (fun d -> q.(d)) to partition_key_of allocates
+   one closure per query on a non-flambda compiler — the only heap traffic left
+   in the hot path — so inline it. *)
+let[@inline] partition_key (q : int array) : int =
+  let key = ref 0 in
+  if Array.unsafe_get q 5 >= 0 then key := !key lor 1;
+  if Array.unsafe_get q 9 > 0 then key := !key lor 2;
+  if Array.unsafe_get q 10 > 0 then key := !key lor 4;
+  if Array.unsafe_get q 11 > 0 then key := !key lor 8;
+  let mr = Array.unsafe_get q 12 in
+  if mr <= 2047 then ()
+  else if mr <= 4095 then key := !key lor (1 lsl 4)
+  else if mr <= 6143 then key := !key lor (2 lsl 4)
+  else key := !key lor (3 lsl 4);
+  if Array.unsafe_get q 2 > 4096 then key := !key lor (1 lsl 6);
+  if Array.unsafe_get q 8 > 2048 then key := !key lor (1 lsl 7);
+  !key
 
 (* --- build --- *)
 
@@ -206,9 +222,19 @@ let build ~n ~(get : int -> int -> int) ~(label : int -> int) : t =
 
 (* --- query --- *)
 
-type scratch = { best_d : int array; best_l : int array }
+type scratch = {
+  best_d : int array;
+  best_l : int array;
+  probe_lb : int array;    (* preallocated probe scratch: bucket lower bounds *)
+  probe_root : int array;  (* preallocated probe scratch: bucket root node ids *)
+}
 
-let create_scratch () = { best_d = Array.make k max_int; best_l = Array.make k 0 }
+let create_scratch () = {
+  best_d = Array.make k max_int;
+  best_l = Array.make k 0;
+  probe_lb = Array.make 256 0;
+  probe_root = Array.make 256 0;
+}
 
 let[@inline] reset_scratch s =
   for i = 0 to k - 1 do
@@ -244,14 +270,21 @@ let[@inline] scan_leaf t s start len (q : int array) =
   for i = 0 to len - 1 do
     let p = start + i in
     let base = p * dim in
+    (* Early-abort: accumulate squared diffs but bail as soon as the partial
+       sum reaches the current 5th-best distance — that point can no longer
+       enter the top-k, so the remaining dims are wasted work. Exact: the
+       partial sum is a lower bound, and we only keep [dd < worst]. *)
+    let worst = Array.unsafe_get s.best_d (k - 1) in
     let acc = ref 0 in
-    for d = 0 to dim - 1 do
-      let v = Bigarray.Array1.unsafe_get t.vecs (base + d) in
-      let diff = v - Array.unsafe_get q d in
-      acc := !acc + diff * diff
+    let d = ref 0 in
+    while !d < dim && !acc < worst do
+      let v = Bigarray.Array1.unsafe_get t.vecs (base + !d) in
+      let diff = v - Array.unsafe_get q !d in
+      acc := !acc + diff * diff;
+      incr d
     done;
     let dd = !acc in
-    if dd < s.best_d.(k - 1) then
+    if dd < worst then
       insert s dd (Char.code (Bytes.unsafe_get t.labels p))
   done
 
@@ -286,21 +319,46 @@ let fraud_count_with s t (q : int array) ~exact : int =
 
   let confident = (not exact) && s.best_d.(k - 1) <= early_limit in
   if not confident then begin
-    (* Probe remaining buckets ordered by bbox lower bound, pruning. *)
-    let probes = ref [] in
+    (* Probe remaining buckets ordered by bbox lower bound, pruning. Collect
+       survivors into preallocated parallel arrays (zero allocation — the old
+       list+List.sort path churned the minor heap on exactly the tail queries
+       that miss early-exit, spiking p99 via GC). *)
+    let worst = Array.unsafe_get s.best_d (k - 1) in
+    let cnt = ref 0 in
     for kk = 0 to 255 do
       if kk <> key then begin
         let r = Array.unsafe_get t.roots kk in
         if r >= 0 then begin
           let lb = lower_bound t r q in
-          if lb < s.best_d.(k - 1) then probes := (lb, r) :: !probes
+          if lb < worst then begin
+            let i = !cnt in
+            Array.unsafe_set s.probe_lb i lb;
+            Array.unsafe_set s.probe_root i r;
+            incr cnt
+          end
         end
       end
     done;
-    let ordered = List.sort (fun (a, _) (b, _) -> compare a b) !probes in
-    List.iter
-      (fun (lb, r) -> if lb < s.best_d.(k - 1) then search_node t s r lb q)
-      ordered
+    (* Insertion sort [0,cnt) by probe_lb ascending — search nearer buckets
+       first so [worst] tightens early and prunes the rest. cnt is small. *)
+    let n = !cnt in
+    for i = 1 to n - 1 do
+      let lb = Array.unsafe_get s.probe_lb i in
+      let r = Array.unsafe_get s.probe_root i in
+      let j = ref (i - 1) in
+      while !j >= 0 && Array.unsafe_get s.probe_lb !j > lb do
+        Array.unsafe_set s.probe_lb (!j + 1) (Array.unsafe_get s.probe_lb !j);
+        Array.unsafe_set s.probe_root (!j + 1) (Array.unsafe_get s.probe_root !j);
+        decr j
+      done;
+      Array.unsafe_set s.probe_lb (!j + 1) lb;
+      Array.unsafe_set s.probe_root (!j + 1) r
+    done;
+    for i = 0 to n - 1 do
+      let lb = Array.unsafe_get s.probe_lb i in
+      if lb < s.best_d.(k - 1) then
+        search_node t s (Array.unsafe_get s.probe_root i) lb q
+    done
   end;
 
   let frauds = ref 0 in
@@ -414,5 +472,18 @@ let load ~path : t =
          Bigarray.int16_signed Bigarray.c_layout false [| n * dim |])
   in
   Unix.close fd;  (* mapping survives independently of the fd *)
+  (* Prefault: touch one element per 4 KiB page so the whole vecs table is
+     resident before serving. The hot path then takes zero minor page faults
+     under load (page faults are a pure tail event — the #1 C entry sidesteps
+     them by keeping the table in malloc'd RAM; we get the same by faulting it
+     in now). 84 MB / 4 KiB ~= 21k touches, trivial. *)
+  let total = n * dim in
+  let stride = 4096 / 2 in            (* 2 bytes per i16 -> one touch per page *)
+  let sink = ref 0 and i = ref 0 in
+  while !i < total do
+    sink := !sink + Bigarray.Array1.unsafe_get vecs !i;
+    i := !i + stride
+  done;
+  ignore (Sys.opaque_identity !sink);
   { n; vecs; labels; node_left; node_right; node_start; node_len;
     node_min; node_max; roots }
