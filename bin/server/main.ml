@@ -25,6 +25,7 @@ let fd_uds = ref ""          (* SEQPACKET unix socket: receive client fds from t
 let reuseport = ref true
 let workers = ref 1
 let warmup = ref 0
+let spin_us = ref 0          (* busy-poll: spin epoll_wait(0) up to this many µs before blocking *)
 
 (* ---- pre-rendered responses ---- *)
 let http_resp body =
@@ -47,6 +48,11 @@ let bad_resp =
 
 (* ---- connection state ---- *)
 let buf_cap = 16384
+
+(* fd -> conn lookup is a flat array indexed by the raw fd int (kernel hands out
+   the lowest free fd, so values stay small under the rinha load + fd limits).
+   This kills the per-request [Hashtbl.find_opt] allocation of a fresh [Some]. *)
+let max_fds = 65536
 
 type conn = {
   fd : Unix.file_descr;
@@ -124,13 +130,13 @@ let serve () =
   E.add epfd lfd_int E.in_;
   Printf.eprintf "[server] listening on %s (epoll)\n%!" label;
 
-  let conns : (int, conn) Hashtbl.t = Hashtbl.create 4096 in
-  let ctrls : (int, unit) Hashtbl.t = Hashtbl.create 8 in
+  let conns : conn option array = Array.make max_fds None in
+  let ctrls : bool array = Array.make max_fds false in
 
   let close_conn c =
     (try E.del epfd c.ifd with _ -> ());
     (try Unix.close c.fd with _ -> ());
-    Hashtbl.remove conns c.ifd
+    Array.unsafe_set conns c.ifd None
   in
 
   let ensure_out c need =
@@ -235,12 +241,16 @@ let serve () =
 
   let handle_readable c =
     let alive = ref true and again = ref true in
-    (* drain the socket *)
+    (* Drain the socket. A short read (n < space) means the kernel buffer is
+       empty, so we stop without the extra confirm-read that would just raise
+       EAGAIN — saving one syscall + one exception alloc per request. Level-
+       triggered epoll re-fires if more data arrives later. *)
     while !again do
-      match Unix.read c.fd c.inbuf c.inlen (buf_cap - c.inlen) with
+      let space = buf_cap - c.inlen in
+      match Unix.read c.fd c.inbuf c.inlen space with
       | 0 -> alive := false; again := false
       | n -> c.inlen <- c.inlen + n;
-             if c.inlen >= buf_cap then again := false  (* full: stop, parse *)
+             if n < space || c.inlen >= buf_cap then again := false
       | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> again := false
       | exception Unix.Unix_error (Unix.EINTR, _, _) -> ()
       | exception _ -> alive := false; again := false
@@ -271,9 +281,12 @@ let serve () =
     Unix.set_nonblock fd;
     (try Unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
     let ifd = E.int_of_fd fd in
-    Hashtbl.replace conns ifd (new_conn fd ifd);
-    (try E.add epfd ifd E.in_
-     with _ -> (try Unix.close fd with _ -> ()); Hashtbl.remove conns ifd)
+    if ifd >= max_fds then (try Unix.close fd with _ -> ())
+    else begin
+      Array.unsafe_set conns ifd (Some (new_conn fd ifd));
+      (try E.add epfd ifd E.in_
+       with _ -> (try Unix.close fd with _ -> ()); Array.unsafe_set conns ifd None)
+    end
   in
 
   (* TCP / unix-stream mode: accept client connections directly. *)
@@ -296,9 +309,12 @@ let serve () =
       | (fd, _) ->
         Unix.set_nonblock fd;
         let ifd = E.int_of_fd fd in
-        Hashtbl.replace ctrls ifd ();
-        (try E.add epfd ifd E.in_
-         with _ -> (try Unix.close fd with _ -> ()); Hashtbl.remove ctrls ifd)
+        if ifd >= max_fds then (try Unix.close fd with _ -> ())
+        else begin
+          Array.unsafe_set ctrls ifd true;
+          (try E.add epfd ifd E.in_
+           with _ -> (try Unix.close fd with _ -> ()); Array.unsafe_set ctrls ifd false)
+        end
       | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> again := false
       | exception Unix.Unix_error (Unix.EINTR, _, _) -> ()
       | exception _ -> again := false
@@ -315,7 +331,7 @@ let serve () =
       else begin
         (try E.del epfd ctrl_ifd with _ -> ());
         (try Unix.close (E.fd_of_int ctrl_ifd) with _ -> ());
-        Hashtbl.remove ctrls ctrl_ifd;
+        Array.unsafe_set ctrls ctrl_ifd false;
         again := false
       end
     done
@@ -323,21 +339,24 @@ let serve () =
 
   let maxev = 1024 in
   let out_fds = Array.make maxev 0 and out_evs = Array.make maxev 0 in
+  let spin = !spin_us in
   while true do
-    let n = E.wait epfd out_fds out_evs (-1) in
+    let n = E.wait_spin epfd out_fds out_evs spin in
     for i = 0 to n - 1 do
       let fd = Array.unsafe_get out_fds i in
       let ev = Array.unsafe_get out_evs i in
       if fd = lfd_int then (if fd_pass then accept_ctrls () else accept_all ())
-      else if fd_pass && Hashtbl.mem ctrls fd then recv_clients fd
-      else match Hashtbl.find_opt conns fd with
+      else if fd_pass && Array.unsafe_get ctrls fd then recv_clients fd
+      else match Array.unsafe_get conns fd with
         | None -> ()
         | Some c ->
           if ev land (E.err lor E.hup) <> 0 && ev land E.in_ = 0 then close_conn c
           else begin
             if ev land E.in_ <> 0 then handle_readable c;
-            if ev land E.out <> 0 && Hashtbl.mem conns fd then
-              (if not (flush c) then close_conn c)
+            if ev land E.out <> 0 then
+              (match Array.unsafe_get conns fd with
+               | Some c -> if not (flush c) then close_conn c
+               | None -> ())  (* handle_readable may have closed it *)
           end
     done
   done
@@ -352,6 +371,7 @@ let main () =
     "--no-reuseport", Arg.Clear reuseport, "disable SO_REUSEPORT";
     "--workers", Arg.Set_int workers, "SO_REUSEPORT worker processes (default 1)";
     "--warmup", Arg.Set_int warmup, "warmup query count before serving";
+    "--spin-us", Arg.Set_int spin_us, "busy-poll spin budget in µs before blocking (default 0 = off)";
   ] in
   Arg.parse speclist (fun _ -> ()) "fraud-server";
 
@@ -359,6 +379,7 @@ let main () =
   (match Sys.getenv_opt "FD_UDS" with Some p when p <> "" -> fd_uds := p | _ -> ());
   (match Sys.getenv_opt "API_WORKERS" with Some w -> (try workers := int_of_string w with _ -> ()) | _ -> ());
   (match Sys.getenv_opt "API_WARMUP_QUERIES" with Some w -> (try warmup := int_of_string w with _ -> ()) | _ -> ());
+  (match Sys.getenv_opt "EPOLL_SPIN_US" with Some w -> (try spin_us := int_of_string w with _ -> ()) | _ -> ());
 
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
 

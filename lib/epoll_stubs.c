@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 
 #define MAX_EV 4096
 static struct epoll_event g_events[MAX_EV];
@@ -49,6 +50,53 @@ CAMLprim value caml_epoll_wait(value epfd, value out_fds, value out_evs, value t
         if (errno == EINTR) return Val_int(0);
         uerror("epoll_wait", Nothing);
     }
+    for (int i = 0; i < n; i++) {
+        Field(out_fds, i) = Val_int(g_events[i].data.fd);
+        Field(out_evs, i) = Val_int((int) g_events[i].events);
+    }
+    return Val_int(n);
+}
+
+/* Like caml_epoll_wait, but busy-poll for up to spin_us microseconds before
+   blocking. The spin calls epoll_wait(timeout=0) WITHOUT releasing the OCaml
+   runtime lock (the loop never blocks, and there is one domain/one thread, so
+   nothing else needs it). This keeps the core in C0, avoiding the deep C-state
+   exit / scheduler wakeup tax a blocking wait pays on an idle core. On budget
+   expiry it releases the lock and does one blocking epoll_wait(-1). */
+CAMLprim value caml_epoll_wait_spin(value epfd, value out_fds, value out_evs, value spin_us) {
+    int max = Wosize_val(out_fds);
+    if (max > MAX_EV) max = MAX_EV;
+    int ep = Int_val(epfd);
+    int budget = Int_val(spin_us);
+    int n = 0;
+
+    if (budget > 0) {
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (;;) {
+            n = epoll_wait(ep, g_events, max, 0);   /* non-blocking poll */
+            if (n != 0) break;                      /* events ready, or error */
+            struct timespec t1;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long us = (t1.tv_sec - t0.tv_sec) * 1000000L
+                    + (t1.tv_nsec - t0.tv_nsec) / 1000L;
+            if (us >= budget) break;                /* spin budget spent */
+        }
+        if (n < 0 && errno == EINTR) n = 0;         /* fall through to blocking */
+        else if (n < 0) uerror("epoll_wait", Nothing);
+        else if (n > 0) goto fill;
+    }
+
+    /* nothing during the spin (or spin disabled): block, releasing the lock */
+    caml_release_runtime_system();
+    n = epoll_wait(ep, g_events, max, -1);
+    caml_acquire_runtime_system();
+    if (n < 0) {
+        if (errno == EINTR) return Val_int(0);
+        uerror("epoll_wait", Nothing);
+    }
+
+fill:
     for (int i = 0; i < n; i++) {
         Field(out_fds, i) = Val_int(g_events[i].data.fd);
         Field(out_evs, i) = Val_int((int) g_events[i].events);

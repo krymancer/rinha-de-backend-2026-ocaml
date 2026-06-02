@@ -4,6 +4,11 @@ external create1 : unit -> int = "caml_epoll_create1"
 external ctl : int -> int -> int -> int -> unit = "caml_epoll_ctl"
 external wait : int -> int array -> int array -> int -> int = "caml_epoll_wait"
 
+(* Like [wait] but busy-polls with epoll_wait(0) for up to [spin_us] µs (holding
+   the runtime lock, keeping the core in C0) before falling back to a blocking
+   wait. [spin_us]=0 behaves exactly like [wait epfd _ _ (-1)]. *)
+external wait_spin : int -> int array -> int array -> int -> int = "caml_epoll_wait_spin"
+
 (* receive a passed fd over a SOCK_SEQPACKET unix socket; >=0 fd, -1 EAGAIN, -2 EOF/err *)
 external recv_fd : int -> int = "caml_recv_fd"
 
