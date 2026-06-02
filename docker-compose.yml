@@ -7,6 +7,7 @@ services:
       INDEX_PATH: /app/index.bin
       FD_UDS: /sockets/api1.sock
       API_WARMUP_QUERIES: "8192"
+      EPOLL_SPIN_US: "150"   # busy-poll before blocking: keep the core in C0, dodge the idle-wake tail
     volumes:
       - sockets:/sockets
     deploy:
@@ -22,6 +23,7 @@ services:
       INDEX_PATH: /app/index.bin
       FD_UDS: /sockets/api2.sock
       API_WARMUP_QUERIES: "8192"
+      EPOLL_SPIN_US: "150"   # busy-poll before blocking: keep the core in C0, dodge the idle-wake tail
 
   lb:
     image: ghcr.io/krymancer/rinha-de-backend-2026-ocaml-lb:latest
