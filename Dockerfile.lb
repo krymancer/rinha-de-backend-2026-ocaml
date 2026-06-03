@@ -1,6 +1,11 @@
 # Forward-only TCP load balancer (HAProxy). Replaces the hand-rolled
 # fd-passing LB, whose blocking send_fd fallback caused a ~3.6ms p99 tail.
 # mode tcp => no HTTP parsing, no detection logic, minimal latency.
+# The entrypoint waits for both API backends before binding :9999, so startup
+# probes never hit HAProxy with all backends down (which resets connections).
 FROM haproxy:2.9-alpine
+USER root
 COPY haproxy.cfg /usr/local/etc/haproxy/haproxy.cfg
+COPY --chmod=755 lb-entrypoint.sh /lb-entrypoint.sh
 EXPOSE 9999
+ENTRYPOINT ["/lb-entrypoint.sh"]
