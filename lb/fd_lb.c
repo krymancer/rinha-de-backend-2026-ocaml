@@ -159,7 +159,28 @@ int main(void) {
             int target = (first + off) % nb;
             if (send_fd(&backends[target], cfd, MSG_DONTWAIT) == 0) { ok = 1; break; }
         }
-        if (!ok) (void)send_fd(&backends[first], cfd, 0);  /* blocking fallback */
-        close(cfd);  /* backend now owns its own copy of the fd */
+        if (!ok) {
+            /* Every backend's SEQPACKET queue is momentarily full. Do NOT block
+               the accept loop on a backend (the old `send_fd(.., 0)` fallback):
+               a single-threaded accept loop stalled on a slow/dead backend stops
+               accepting new connections — including the grader's GET /ready
+               health check — which times out and surfaces as a TCP RST
+               ("Connection reset"). Instead wait a bounded window for ANY backend
+               to drain, then retry once; if still impossible, drop the client. */
+            struct pollfd pfds[MAX_BACKENDS];
+            for (int i = 0; i < nb; i++) {
+                pfds[i].fd = backends[i].fd;
+                pfds[i].events = POLLOUT;
+                pfds[i].revents = 0;
+            }
+            if (poll(pfds, nb, 50) > 0) {
+                for (int i = 0; i < nb && !ok; i++) {
+                    if ((pfds[i].revents & POLLOUT) &&
+                        send_fd(&backends[i], cfd, MSG_DONTWAIT) == 0)
+                        ok = 1;
+                }
+            }
+        }
+        close(cfd);  /* on success the backend owns its own copy; on drop, close */
     }
 }

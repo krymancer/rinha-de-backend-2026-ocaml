@@ -277,16 +277,25 @@ let serve () =
     end
   in
 
-  let register_client fd =
-    Unix.set_nonblock fd;
-    (try Unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
+  (* [configured]=true means the fd already carries O_NONBLOCK + TCP_NODELAY.
+     Fds passed by the LB do: the LB accept4()s with SOCK_NONBLOCK and sets
+     TCP_NODELAY, and both survive SCM_RIGHTS — O_NONBLOCK lives on the shared
+     open file description, TCP_NODELAY on the shared socket — so re-setting them
+     here is two dead syscalls per accepted connection. Only the direct-accept
+     path (TCP/unix) hands us a raw fd that still needs configuring. *)
+  let register_client ?(configured = false) fd =
+    if not configured then begin
+      Unix.set_nonblock fd;
+      (try Unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ())
+    end;
     let ifd = E.int_of_fd fd in
     if ifd >= max_fds then (try Unix.close fd with _ -> ())
-    else begin
-      Array.unsafe_set conns ifd (Some (new_conn fd ifd));
-      (try E.add epfd ifd E.in_
-       with _ -> (try Unix.close fd with _ -> ()); Array.unsafe_set conns ifd None)
-    end
+    else
+      (* Register with epoll FIRST; only record the conn if that succeeds, so a
+         failed epoll_ctl never leaves a live fd in [conns] with no waiter. *)
+      match (try E.add epfd ifd E.in_; true with _ -> false) with
+      | true -> Array.unsafe_set conns ifd (Some (new_conn fd ifd))
+      | false -> (try Unix.close fd with _ -> ())
   in
 
   (* TCP / unix-stream mode: accept client connections directly. *)
@@ -310,11 +319,11 @@ let serve () =
         Unix.set_nonblock fd;
         let ifd = E.int_of_fd fd in
         if ifd >= max_fds then (try Unix.close fd with _ -> ())
-        else begin
-          Array.unsafe_set ctrls ifd true;
-          (try E.add epfd ifd E.in_
-           with _ -> (try Unix.close fd with _ -> ()); Array.unsafe_set ctrls ifd false)
-        end
+        else
+          (* epoll-add before marking the ctrl slot, same ordering as clients *)
+          (match (try E.add epfd ifd E.in_; true with _ -> false) with
+           | true -> Array.unsafe_set ctrls ifd true
+           | false -> (try Unix.close fd with _ -> ()))
       | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> again := false
       | exception Unix.Unix_error (Unix.EINTR, _, _) -> ()
       | exception _ -> again := false
@@ -326,7 +335,7 @@ let serve () =
     let again = ref true in
     while !again do
       let r = E.recv_fd ctrl_ifd in
-      if r >= 0 then register_client (E.fd_of_int r)
+      if r >= 0 then register_client ~configured:true (E.fd_of_int r)
       else if r = -1 then again := false
       else begin
         (try E.del epfd ctrl_ifd with _ -> ());
