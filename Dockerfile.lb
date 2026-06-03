@@ -1,11 +1,6 @@
-# Forward-only fd-passing load balancer.
-FROM debian:12-slim AS build
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && \
-    rm -rf /var/lib/apt/lists/*
-COPY lb/fd_lb.c /fd_lb.c
-RUN gcc -O2 -Wall -o /fd_lb /fd_lb.c
-
-FROM debian:12-slim
-COPY --from=build /fd_lb /usr/local/bin/fd_lb
+# Forward-only TCP load balancer (HAProxy). Replaces the hand-rolled
+# fd-passing LB, whose blocking send_fd fallback caused a ~3.6ms p99 tail.
+# mode tcp => no HTTP parsing, no detection logic, minimal latency.
+FROM haproxy:2.9-alpine
+COPY haproxy.cfg /usr/local/etc/haproxy/haproxy.cfg
 EXPOSE 9999
-ENTRYPOINT ["/usr/local/bin/fd_lb"]
