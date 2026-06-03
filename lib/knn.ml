@@ -31,9 +31,16 @@ let early_limit = 1400 * 1400
 let leaf_size = 128
 
 type i16ba = (int, Bigarray.int16_signed_elt, Bigarray.c_layout) Bigarray.Array1.t
+type intba = (int, Bigarray.int_elt, Bigarray.c_layout) Bigarray.Array1.t
 
 let make_i16 n : i16ba =
   Bigarray.Array1.create Bigarray.int16_signed Bigarray.c_layout n
+
+(* SIMD (SSE4.1) leaf scan: write exact i64 squared distances from the 16-wide
+   query [q16] (dims 0..13, lanes 14,15 = 0) to points [start, start+len) into
+   [out]. Bit-identical to the scalar path (asserted by tests/test_knn.ml). *)
+external simd_leaf_dists : i16ba -> i16ba -> int -> int -> intba -> unit
+  = "fraud_simd_leaf_dists" [@@noalloc]
 
 type t = {
   n : int;
@@ -227,14 +234,21 @@ type scratch = {
   best_l : int array;
   probe_lb : int array;    (* preallocated probe scratch: bucket lower bounds *)
   probe_root : int array;  (* preallocated probe scratch: bucket root node ids *)
+  q16 : i16ba;             (* 16-wide i16 query for the SIMD kernel; lanes 14,15 stay 0 *)
+  dists : intba;           (* leaf distance output buffer (size leaf_size) *)
 }
 
-let create_scratch () = {
-  best_d = Array.make k max_int;
-  best_l = Array.make k 0;
-  probe_lb = Array.make 256 0;
-  probe_root = Array.make 256 0;
-}
+let create_scratch () =
+  let q16 = make_i16 16 in
+  for i = 0 to 15 do Bigarray.Array1.unsafe_set q16 i 0 done;
+  {
+    best_d = Array.make k max_int;
+    best_l = Array.make k 0;
+    probe_lb = Array.make 256 0;
+    probe_root = Array.make 256 0;
+    q16;
+    dists = Bigarray.Array1.create Bigarray.int Bigarray.c_layout leaf_size;
+  }
 
 let[@inline] reset_scratch s =
   for i = 0 to k - 1 do
@@ -266,26 +280,17 @@ let[@inline] lower_bound t node (q : int array) : int =
   done;
   !acc
 
-let[@inline] scan_leaf t s start len (q : int array) =
+(* Compute all leaf distances with one SIMD call, then fold into the top-k.
+   The SIMD kernel has no per-point early-abort, but it is far cheaper than the
+   14-dim scalar loop on the full scans that dominate the hard-query tail (where
+   [worst] is large so early-abort rarely fired anyway). [insert] still keeps
+   only [dd < worst], so the top-k result is exact. *)
+let[@inline] scan_leaf t s start len =
+  simd_leaf_dists t.vecs s.q16 start len s.dists;
   for i = 0 to len - 1 do
-    let p = start + i in
-    let base = p * dim in
-    (* Early-abort: accumulate squared diffs but bail as soon as the partial
-       sum reaches the current 5th-best distance — that point can no longer
-       enter the top-k, so the remaining dims are wasted work. Exact: the
-       partial sum is a lower bound, and we only keep [dd < worst]. *)
-    let worst = Array.unsafe_get s.best_d (k - 1) in
-    let acc = ref 0 in
-    let d = ref 0 in
-    while !d < dim && !acc < worst do
-      let v = Bigarray.Array1.unsafe_get t.vecs (base + !d) in
-      let diff = v - Array.unsafe_get q !d in
-      acc := !acc + diff * diff;
-      incr d
-    done;
-    let dd = !acc in
-    if dd < worst then
-      insert s dd (Char.code (Bytes.unsafe_get t.labels p))
+    let dd = Bigarray.Array1.unsafe_get s.dists i in
+    if dd < Array.unsafe_get s.best_d (k - 1) then
+      insert s dd (Char.code (Bytes.unsafe_get t.labels (start + i)))
   done
 
 (* Branch-and-bound over a subtree rooted at [root] (whose lower bound is
@@ -294,7 +299,7 @@ let rec search_node t s root root_bound (q : int array) =
   if root_bound < s.best_d.(k - 1) then begin
     let left = Array.unsafe_get t.node_left root in
     if left < 0 then
-      scan_leaf t s (Array.unsafe_get t.node_start root) (Array.unsafe_get t.node_len root) q
+      scan_leaf t s (Array.unsafe_get t.node_start root) (Array.unsafe_get t.node_len root)
     else begin
       let right = Array.unsafe_get t.node_right root in
       let lb = lower_bound t left q in
@@ -313,6 +318,11 @@ let rec search_node t s root root_bound (q : int array) =
                      the confident radius; probes other buckets otherwise. *)
 let fraud_count_with s t (q : int array) ~exact : int =
   reset_scratch s;
+  (* Stage the query for the SIMD leaf kernel; lanes 14,15 stay 0. q values are
+     in [-10000, 10000], well within i16. *)
+  for d = 0 to dim - 1 do
+    Bigarray.Array1.unsafe_set s.q16 d (Array.unsafe_get q d)
+  done;
   let key = partition_key q in
   let primary = Array.unsafe_get t.roots key in
   if primary >= 0 then search_node t s primary (lower_bound t primary q) q;

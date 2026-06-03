@@ -1,5 +1,5 @@
 (library
  (name fraud)
  (libraries unix yojson)
- (foreign_stubs (language c) (names epoll_stubs))
+ (foreign_stubs (language c) (names epoll_stubs knn_simd) (flags (:standard -O3 -msse4.1)))
  (ocamlopt_flags (:standard -O3 -unsafe)))
