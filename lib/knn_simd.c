@@ -23,8 +23,25 @@
 #include <caml/bigarray.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/mman.h>
 
 #define KDIM 14
+
+/* Hint the kernel to keep the (anonymous) index resident and back it with
+   transparent hugepages, cutting TLB misses on the random 84 MB access pattern.
+   Best-effort: failures are ignored. Not SIMD, so it lives outside the SSE
+   block below. */
+CAMLprim value fraud_advise_resident(value vba, value vbytes) {
+    void *p = (void *)Caml_ba_data_val(vba);
+    size_t len = (size_t)Long_val(vbytes);
+#ifdef MADV_HUGEPAGE
+    (void)madvise(p, len, MADV_HUGEPAGE);
+#endif
+#ifdef MADV_WILLNEED
+    (void)madvise(p, len, MADV_WILLNEED);
+#endif
+    return Val_unit;
+}
 
 #if defined(__SSE4_1__)
 #include <smmintrin.h>

@@ -13,6 +13,8 @@ services:
       INDEX_PATH: /app/index.bin
       FD_UDS: /sockets/api1.sock
       API_WARMUP_QUERIES: "8192"
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
     volumes:
       - sockets:/sockets
     deploy:
@@ -38,6 +40,8 @@ services:
     environment:
       LB_PORT: "9999"
       API_SOCKETS: /sockets/api1.sock,/sockets/api2.sock
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
     volumes:
       - sockets:/sockets
     depends_on:

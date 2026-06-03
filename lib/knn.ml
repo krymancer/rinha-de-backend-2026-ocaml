@@ -42,6 +42,9 @@ let make_i16 n : i16ba =
 external simd_leaf_dists : i16ba -> i16ba -> int -> int -> intba -> unit
   = "fraud_simd_leaf_dists" [@@noalloc]
 
+(* Pin the index resident + THP hint (madvise). Best-effort. *)
+external advise_resident : i16ba -> int -> unit = "fraud_advise_resident" [@@noalloc]
+
 type t = {
   n : int;
   vecs : i16ba;            (* n*dim, leaf-contiguous *)
@@ -475,25 +478,37 @@ let load ~path : t =
   let labels = read n in
   In_channel.close ic;
   let vpos = vecs_offset ~n ~node_count:nc in
-  let fd = Unix.openfile path [ Unix.O_RDONLY ] 0 in
-  let vecs =
-    Bigarray.array1_of_genarray
-      (Unix.map_file fd ~pos:(Int64.of_int vpos)
-         Bigarray.int16_signed Bigarray.c_layout false [| n * dim |])
-  in
-  Unix.close fd;  (* mapping survives independently of the fd *)
-  (* Prefault: touch one element per 4 KiB page so the whole vecs table is
-     resident before serving. The hot path then takes zero minor page faults
-     under load (page faults are a pure tail event — the #1 C entry sidesteps
-     them by keeping the table in malloc'd RAM; we get the same by faulting it
-     in now). 84 MB / 4 KiB ~= 21k touches, trivial. *)
+  (* Load vecs into ANONYMOUS RAM instead of mmap'ing the file. A file-backed
+     mmap is page cache: under the 165 MB cgroup cap the kernel reclaims those
+     pages, and the next query that touches a reclaimed page takes a refault —
+     a multi-ms p99 tail that is immune to compute speed, cpuset, and busy-poll
+     (which is exactly the flat ~3.6 ms we measured). Anonymous memory cannot be
+     reclaimed without swap, and containers have none, so it stays resident.
+     Read in 1 MiB chunks so peak RSS stays flat (no mmap+copy 2x spike). *)
   let total = n * dim in
-  let stride = 4096 / 2 in            (* 2 bytes per i16 -> one touch per page *)
-  let sink = ref 0 and i = ref 0 in
-  while !i < total do
-    sink := !sink + Bigarray.Array1.unsafe_get vecs !i;
-    i := !i + stride
+  let vecs = make_i16 total in
+  let fd = Unix.openfile path [ Unix.O_RDONLY ] 0 in
+  ignore (Unix.lseek fd vpos Unix.SEEK_SET);
+  let chunk_elems = 1 lsl 19 in                  (* 512k i16 = 1 MiB per read *)
+  let buf = Bytes.create (chunk_elems * 2) in
+  let pos = ref 0 in
+  while !pos < total do
+    let want = min chunk_elems (total - !pos) in
+    let nbytes = want * 2 in
+    let got = ref 0 in
+    while !got < nbytes do
+      let r = Unix.read fd buf !got (nbytes - !got) in
+      if r = 0 then failwith "Knn.load: short read on vecs";
+      got := !got + r
+    done;
+    for j = 0 to want - 1 do
+      Bigarray.Array1.unsafe_set vecs (!pos + j) (Bytes.get_int16_le buf (j * 2))
+    done;
+    pos := !pos + want
   done;
-  ignore (Sys.opaque_identity !sink);
+  Unix.close fd;
+  (* THP hint: anonymous pages are transparent-hugepage eligible, so the random
+     84 MB access pattern touches far fewer TLB entries. Best-effort. *)
+  advise_resident vecs (total * 2);
   { n; vecs; labels; node_left; node_right; node_start; node_len;
     node_min; node_max; roots }
