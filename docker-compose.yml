@@ -2,18 +2,13 @@ services:
   api1: &api
     image: ghcr.io/krymancer/rinha-de-backend-2026-ocaml:latest
     platform: linux/amd64
-    # No cpuset: with only 2 physical cores (4 HT threads) on the grader, pinning
-    # the LB to threads 2,3 made them HT-siblings of the API cores 0,1 — so the LB
-    # stole execution units from a busy API mid-query. Letting CFS schedule freely
-    # (bounded by the cpus quota below) avoids that forced contention.
+    # TCP mode: no FD_UDS, so the server binds TCP :9999 directly. HAProxy
+    # round-robins to api1:9999 / api2:9999 over the bridge network.
     environment:
       INDEX_PATH: /app/index.bin
-      FD_UDS: /sockets/api1.sock
       API_WARMUP_QUERIES: "8192"
     ulimits:
       nofile: { soft: 65535, hard: 65535 }
-    volumes:
-      - sockets:/sockets
     deploy:
       resources:
         limits:
@@ -24,20 +19,14 @@ services:
     <<: *api
     environment:
       INDEX_PATH: /app/index.bin
-      FD_UDS: /sockets/api2.sock
       API_WARMUP_QUERIES: "8192"
 
   lb:
     image: ghcr.io/krymancer/rinha-de-backend-2026-ocaml-lb:latest
     platform: linux/amd64
     ports: ["9999:9999"]
-    environment:
-      LB_PORT: "9999"
-      API_SOCKETS: /sockets/api1.sock,/sockets/api2.sock
     ulimits:
       nofile: { soft: 65535, hard: 65535 }
-    volumes:
-      - sockets:/sockets
     depends_on:
       api1: { condition: service_started }
       api2: { condition: service_started }
@@ -50,11 +39,3 @@ services:
 networks:
   default:
     driver: bridge
-
-volumes:
-  sockets:
-    driver: local
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
-      o: "size=4m"
